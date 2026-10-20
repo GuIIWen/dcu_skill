@@ -9,6 +9,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 
 - **只做 sglang 的 PD 分离部署**（prefill + decode + mooncake + sglang_router，xPyD）。其它推理框架、非 PD 分离（单实例 / 普通多副本）、其它部署形态都不适用，遇到就告诉用户本 skill 不支持，不要硬套。
 - **支持切换的只有模型和 sglang 版本**：模型改 `[model] dir`（和 `served_model_name`），版本改 `[image] ref`（版本由镜像决定）。随之需要调整的 env / args 在 `[env.*]` / `[args.*]` 里改；模板默认值是 DeepSeek-V4-Flash + sglang 0.5.18 的组合，换模型或版本后这些参数不保证适用，渲染不会替你校验，起不来时按排障表查 cookbook。
+- **模型路径要同时核对宿主机和容器映射**：`container.model_root` 会以只读方式挂到容器 `/model`，所以宿主机 `${model_root}/${model.dir}` 对应容器 `/model/${model.dir}`。例如宿主机模型在 `/data0/model/DeepSeek...` 且 `model_root = "/data0"` 时，`model.dir` 必须写 `model/DeepSeek...`，容器路径才是 `/model/model/DeepSeek...`。渲染后的目标容器检查必须确认容器内 `config.json` 存在。
 - **当前只支持单机实例**：每个 prefill / decode 实例必须在一台节点内（`cards ≤ cards_per_node`，如 8 卡）；一个节点上可以放多个实例（卡不重叠），多节点上可以分别放不同实例。**一个实例跨多台节点（多机 TP / EP）暂不支持**：用户提出这类场景（`prefill_cards`/`decode_cards` 大于 `cards_per_node`，或显式写 `nodes = [...]`）时，告知不支持，不要生成也不要部署。render.py 里的跨节点代码未在真机验证，不得使用。
 - 运行环境：节点是 Hygon DCU（hy-smi / ROCm 系），容器内服务，经 remote-linux MCP 访问。
 
@@ -96,7 +97,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 对每个节点（并行）：
 
 - 跑 `image.check_cmd`。存在且 `pull_policy != always` → 跳过。
-- 需要拉：跑 `image.pull_cmd`（后台）后**立即进入第 5 步**，不要干等。之后在参数确认的间隙每 30 秒左右 `tail -n 3 <pull_log>` 并跑 `check_cmd`，直到镜像存在。`pull_log` 里出现 `Error`/`denied`/`connection refused`/`no such host`/`http: server gave HTTP response to HTTPS client` 等错误 → 停下报告，不重试、不改配置。
+- 需要拉：跑 `image.pull_cmd`（后台）后**立即进入第 5 步**，不要干等。之后在参数确认的间隙每 30 秒左右 `tail -n 3 <pull_log>` 并跑 `check_cmd`，直到镜像存在。`pull_log` 里出现 `Error`/`denied`/`connection refused`/`no such host`/`http: server gave HTTP response to HTTPS client` 等错误 → 停下报告，不自动反复重试、不改 Docker 配置；用户明确说明已在节点外修好 registry 配置后，可以重新跑一次 `check_cmd` 和 `pull_cmd`，继续原流程。
 - `pull_policy = never` 且不存在 → 预检阶段就已是 FAIL。
 - **镜像工具检查（子 agent）**：哪个节点的镜像就绪，就让只读子 agent 在该节点跑 `image.tools_check_cmd`（用镜像起一次性容器，见“环境检查只认镜像或目标容器”），不用等所有节点。缺 `sglang`/`curl`/`sglang_router`/`mooncake_master` → 停下报告，不建容器。没有 `rpc_port_ok` 的处理见第 6 步。
 
@@ -126,11 +127,11 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 - 存在、已退出、配置一致（`on_conflict = reuse`）：`start_cmd`。
 - 用户确认过 recreate：`rm_cmd` 后 `run_cmd`。
 
-先在每个节点以宿主机用户执行 `nodes[].prepare_dirs_cmd`，创建并检查 `<deploy_dir>/{scripts,logs,run,profile}` 可写；失败就停止，不能让容器里的 root 先创建这些目录。然后按预检结论创建/复用容器，再跑 `tools_check_cmd` 和 `write_check_cmd`（此时都是目标容器）：缺工具或 work_dir 不可写 → 停下报告。复用的老容器以这一步为准（容器里环境可能和镜像不同）。prefill_1 若没有 `rpc_port_ok`，说明这版 mooncake_master 不支持 `--rpc_port`：告诉用户，并建议把 `mooncake.rpc_port` 改回默认 50051，同时在 `mooncake.extra_args` 里去掉相关参数，然后重新渲染；不要自己改脚本。
+先在每个节点以宿主机用户执行 `nodes[].prepare_dirs_cmd`，创建并检查 `<deploy_dir>/{scripts,logs,run,profile}` 可写；失败就停止，不能让容器里的 root 先创建这些目录。然后按预检结论创建/复用容器，再跑 `tools_check_cmd`、`write_check_cmd`（目标容器）和 `nodes[].upload_check_cmd`（宿主机）：缺工具、容器内模型 `config.json` 不存在、work_dir 不可写、脚本含 CRLF 或 `bash -n` 失败 → 停下报告。复用的老容器以这一步为准（容器里环境可能和镜像不同）。prefill_1 若没有 `rpc_port_ok`，说明这版 mooncake_master 不支持 `--rpc_port`：告诉用户，并建议把 `mooncake.rpc_port` 改回默认 50051，同时在 `mooncake.extra_args` 里去掉相关参数，然后重新渲染；不要自己改脚本。
 
 ### 7. 上传文件
 
-对每个节点（只有 `plan.json` 的 `nodes` 里列出的节点），把 `uploads` 里的每个文件读出来，用 `write_file(host=mcp_host, path=remote, content=...)` 写到宿主机（work_dir 已挂进容器，宿主机写入即容器可见）。上传的必须是第 5 步确认过的那次渲染结果。写完 `exec` 一次 `ls -l <deploy_dir>/scripts` 核对。
+对每个节点（只有 `plan.json` 的 `nodes` 里列出的节点），把 `uploads` 里的每个文件读出来，用 `write_file(host=mcp_host, path=remote, content=...)` 写到宿主机（work_dir 已挂进容器，宿主机写入即容器可见）。shell 文件上传时统一使用 LF 换行；不得把 PowerShell 的 CRLF 原样写入远端。上传的必须是第 5 步确认过的那次渲染结果。写完执行 `nodes[].upload_check_cmd`，确认脚本存在、无 CRLF 且 `bash -n` 通过，再执行一次 `ls -l <deploy_dir>/scripts` 核对。
 
 ### 8. 启动（严格按顺序，前一步就绪才走下一步）
 
@@ -144,12 +145,12 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 2. **所有 prefill**（可同时起）：对每个实例的**每个 member**跑 `launch_cmd`。跨节点实例的所有 rank 必须同时启动（依次连续发出，不要等 rank0 就绪再起其它 rank）。
 3. **所有 decode**（可同时起）：同上。
 4. 轮询每个实例的每个 member，间隔 `run.poll_interval_s`，总超时 `run.startup_timeout_s`：
-   - 任一 member 的 `alive_cmd` 为 `dead` → 失败；
+   - 任一 member 的 `alive_cmd` 为 `dead` → 失败；`alive_cmd` 检查 leader PID，不能只依赖负 PGID；端口监听和 ready marker 仍需分别核对；
    - 任一 member 的 `error_scan_cmd` 命中致命错误，或 member `log` 最后 100 行出现 `Traceback`、异常退出、OOM、端口占用 → 失败；
    - `multimem all-gather disabled` 伴随 `CUDA error: invalid argument` 是当前镜像已观察到的非致命告警；只要进程仍 alive 且 ready，继续启动并在验收报告中注明；
-   - `ready_cmd` 是 member 级判据：rank0 看到 `The server is fired up and ready to roll!` 时输出 `ready`，没有该标记时用 HTTP 端口检查输出 `listening`；非 rank0 必须看到该日志标记并输出 `ready`。所有 members 的 `ready_cmd` 都必须通过，且实例顶层 `listen_check_cmd` 输出 `listening` 后才算实例就绪。这个 marker 必须在本次真实日志中核对；超时仍没有 marker/监听就是失败，不能把“进程还活着”当 ready。启动阶段不要把实例 `/health` 200 当作 router 启动前置条件，PD worker 的 health 可能要等 router 注册后才返回 200。
+   - `ready_cmd` 是 member 级判据：所有 rank 都必须在本次日志中看到 `The server is fired up and ready to roll!` 并输出 `ready`；端口监听只作为单独的 `listen_check_cmd`，不能代替 ready marker。所有 members 的 `ready_cmd` 都必须通过，且实例顶层 `listen_check_cmd` 输出 `listening` 后才算实例就绪。不能把“进程还活着”或“端口已监听”当作 ready。启动阶段不要把实例 `/health` 200 当作 router 启动前置条件，PD worker 的 health 可能要等 router 注册后才返回 200。
    - 每轮同时执行 `warning_scan_cmd`；它只报告已知的 `multimem all-gather disabled` 告警。该告警不计入 `error_scan_cmd` 的致命错误，但要在最终报告中注明。
-5. **router**：所有 prefill/decode 的 members ready 后执行 `router.launch_cmd`，轮询 `router.health_cmd` 到 `200`（最多约 5 分钟），失败处理同上。
+5. **router**：所有 prefill/decode 的 members ready 后执行 `router.launch_cmd`，轮询 `router.health_cmd` 到 `200`（最多约 5 分钟）。router health 通过后，才轮询所有 prefill/decode 的 `health_cmd` 到 `200`，然后执行第 9 步最终推理验收。
 
 任何一步失败：按 `stop_order` 对已启动的组件跑 `stop_cmd`（实例要停掉其全部 members），保留容器，报告。
 
@@ -160,9 +161,15 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 1. 每个 prefill/decode 的 `health_cmd` = `200`。
 2. 每个 prefill 实例的每个 member：`mooncake_ok_cmd` 结果 = 该 member 的 `mooncake_expected`（该节点上的卡数；各 member 之和 = 实例 `ranks`）。少了 → 检查 `--enable-hierarchical-cache`、`hicache-storage-backend` 是否被改掉（文档 FAQ：缺这个参数时 mooncake 分配为 0）。
 3. `mooncake.mem_cmd` 显示的总量 = `mooncake.expected_total`（master 日志每 10 秒左右刷新一次，没出现就等一会再查）。为 0 时同上排查。
-4. `final_curl_batch_cmd`（在 prefill_1 rank0 容器内执行，经 MCP 发到该容器所在宿主机，`timeout=660`）按 prefill 实例数发送请求；每个响应的 `choices[0].message` 必须有非空 `content` 或 `reasoning_content`。同时检查 router 日志，确认请求按 `round_robin` 覆盖每个 prefill；单次 `final_curl_cmd` 仅作兼容性调试命令，不足以完成验收。把响应和路由覆盖摘要给用户。
+4. `final_curl_validate_batch_cmd`（在 prefill_1 rank0 容器内执行，经 MCP 发到该容器所在宿主机，`timeout=660`）按 prefill 实例数发送请求；命令会解析每个 JSON 响应，并强制检查 `choices[0].message` 有非空 `content` 或 `reasoning_content`。同时检查 router 日志，确认请求按 `round_robin` 覆盖每个 prefill；`final_curl_batch_cmd` 仅用于需要保留原始响应的调试。把响应和路由覆盖摘要给用户。
 
 成功后汇报：对外地址（`router.url` + `/v1`）、模型名、各组件日志路径（`<deploy_dir>/logs/<名字>.log` 是指向最新日志的软链）、停服方法。
+
+## 清理推理 cache
+
+- 运行中的服务优先通过 `router.flush_cache_cmd` 调用 router 的 `POST /flush_cache`，由 router 广播到所有 HTTP worker；返回的 `workers_flushed` 必须等于 plan 中的后端数量。
+- 该操作清理 sglang 的运行时 KV/radix cache，不删除模型文件、Docker 镜像或宿主机 page cache；有运行中或排队请求时，先等待请求结束再重试，并检查 router 和所有后端仍为健康。
+- router 不支持 `/flush_cache` 时，才按实例逐个调用后端的 `POST /flush_cache`，并逐个核对 HTTP 200。
 
 ## 停服 / 重启
 

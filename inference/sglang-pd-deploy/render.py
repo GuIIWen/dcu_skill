@@ -1606,14 +1606,12 @@ def prepare_dirs_cmd(cfg: Config) -> str:
 def component_cmds(cfg: Config, container: str, name: str, ready_port: int | None = None) -> dict:
     p = script_paths(cfg, name)
     alive_inner = (f"p=$(cat {q(p['pid_file'])} 2>/dev/null) && "
-                   f"kill -0 -- -$p 2>/dev/null && echo alive || echo dead")
-    if ready_port:
-        port_ready = LISTEN_CHECK.format(ports=str(ready_port))
-        ready_inner = (f"if grep -Fq {q(SERVER_READY_MARKER)} {q(p['log'])} 2>/dev/null; then echo ready; "
-                       f"else {port_ready}; fi")
-    else:
-        ready_inner = (f"grep -Fq {q(SERVER_READY_MARKER)} {q(p['log'])} 2>/dev/null && "
-                       "echo ready || echo loading")
+                   f"kill -0 $p 2>/dev/null && echo alive || echo dead")
+    # The HTTP port can listen before sglang has finished initialization.  Keep
+    # readiness separate from listen checks so router startup never races model
+    # initialization.
+    ready_inner = (f"grep -Fq {q(SERVER_READY_MARKER)} {q(p['log'])} 2>/dev/null && "
+                   "echo ready || echo loading")
     fatal_scan_inner = (f"grep -nE {q(ERROR_PATTERN)} {q(p['log'])} 2>/dev/null | "
                         f"grep -vF {q(KNOWN_NONFATAL_ERROR_PATTERN)} | tail -n 20")
     warning_scan_inner = (f"grep -nF {q(KNOWN_NONFATAL_ERROR_PATTERN)} {q(p['log'])} 2>/dev/null | "
@@ -1645,18 +1643,34 @@ LISTEN_CHECK = (
 )
 
 
-def upload_list(cfg: Config, node: Node, out: Path) -> list:
-    dd = cfg.deploy_dir
-    scripts = out / "scripts"
+def upload_script_names(cfg: Config, node: Node) -> list:
     names = [m.name for i, m in cfg.members_on(node.alias)]
     if cfg.p1.rank0.node == node.alias:
         names += ["mooncake_master", "router"]
     names.append("stop")
+    return names
+
+
+def upload_list(cfg: Config, node: Node, out: Path) -> list:
+    dd = cfg.deploy_dir
+    scripts = out / "scripts"
+    names = upload_script_names(cfg, node)
     ups = [{"local": str((scripts / f"{n}.sh").resolve()), "remote": f"{dd}/scripts/{n}.sh"} for n in names]
     if not cfg.deepep_custom:
         ups.append({"local": str((out / "deepep-config.json").resolve()),
                     "remote": f"{dd}/deepep-config.json"})
     return ups
+
+
+def upload_check_cmd(cfg: Config, node: Node) -> str:
+    """Validate uploaded shell scripts on the host before any launch_cmd."""
+    files = [f"{cfg.deploy_dir}/scripts/{n}.sh" for n in upload_script_names(cfg, node)]
+    checks = []
+    for path in files:
+        checks.append(f"test -f {q(path)}")
+        checks.append(f"! grep -q $'\\r' {q(path)}")
+        checks.append(f"bash -n {q(path)}")
+    return " && ".join(checks) + " && echo uploads_ok"
 
 
 def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dict) -> dict:
@@ -1686,6 +1700,7 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
             "preflight_cmd": f"echo {b64} | base64 -d | bash",
             "diag_cmd": f"echo {diag_b64[node.alias]} | base64 -d | bash",
             "prepare_dirs_cmd": prepare_dirs_cmd(cfg),
+            "upload_check_cmd": upload_check_cmd(cfg, node),
             "containers": [i.name for i, m in cfg.members_on(node.alias)],
             "uploads": upload_list(cfg, node, out),
         })
@@ -1696,6 +1711,7 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
         for m in i.members:
             node = cfg.node_of(m)
             tools = TOOLS_CHECK
+            tools += f"; test -f {q(cfg.model_path + 'config.json')} && echo model_path_ok"
             if m is p1.rank0:
                 tools += "; " + MOONCAKE_TOOLS_CHECK
             w = f"{dd}/logs/.w_{c}"
@@ -1745,6 +1761,9 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
         "port": cfg.router_port, "launch_cmd": rt["launch_cmd"], "stop_cmd": rt["stop_cmd"],
         "log": rt["log"], "alive_cmd": rt["alive_cmd"],
         "health_cmd": health_cmd(p1.name, p1node.ip, cfg.router_port),
+        "flush_cache_cmd": (f"docker exec {q(p1.name)} bash -lc "
+                            f"{q(f'curl -sS -X POST -m 30 {url}/flush_cache')}"),
+        "expected_workers": len(cfg.instances),
         "error_scan_cmd": rt["error_scan_cmd"],
         "warning_scan_cmd": rt["warning_scan_cmd"],
     }
@@ -1757,9 +1776,18 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
                 f"-H 'Content-Type: application/json' -d {q(body)}")
     plan["final_curl_cmd"] = dexec(p1.name, curl_one)
     plan["acceptance_request_count"] = max(1, len(cfg.prefills))
+    check_py = ("import json,sys; d=json.load(sys.stdin); c=d.get('choices') or []; "
+                "assert c, d; m=c[0].get('message') or {}; "
+                "assert m.get('content') or m.get('reasoning_content'), d; print('response_ok')")
+    plan["final_curl_validate_cmd"] = dexec(
+        p1.name, f"{curl_one} | python -c {q(check_py)}")
     batch = (f"set -eu; n=1; while [ $n -le {plan['acceptance_request_count']} ]; do "
              f"printf 'PROBE %s\\n' \"$n\"; {curl_one}; printf '\\n'; n=$((n+1)); done")
     plan["final_curl_batch_cmd"] = dexec(p1.name, batch)
+    checked_batch = (f"set -eu; n=1; while [ $n -le {plan['acceptance_request_count']} ]; do "
+                     f"printf 'PROBE %s\\n' \"$n\"; {curl_one} | python -c {q(check_py)}; "
+                     f"n=$((n+1)); done")
+    plan["final_curl_validate_batch_cmd"] = dexec(p1.name, checked_batch)
     plan["stop_order"] = (["router"] + [i.name for i in cfg.decodes]
                           + [i.name for i in cfg.prefills] + ["mooncake"])
     return plan
