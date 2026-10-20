@@ -1,0 +1,357 @@
+# 适用范围：仅 sglang PD 分离部署；可切换模型（[model]）和版本（[image]）；当前只支持单机实例（每个实例在一台节点内）。
+# 下文所有“跨节点”写法和示例暂不支持、未在真机验证，不要使用。
+# sglang PD 分离部署清单模板（xPyD，mooncake + sglang_router）
+# 复制为 deploy.toml 后填写。agent 读取它 → 预检 → 汇总给用户确认 → 执行。
+#
+# 约定
+# - 标 [必填] 的没有默认值，缺了 agent 会停下来问。
+# - [env.*] / [args.*] 默认值取自《ZTE dsv4-flash-0731-fp8 3p1d推理部署》（文档验证场景：单节点 4 卡/实例），
+#   用户可改；所有实例共用。部署前 agent 会把每个实例最终的 env + 启动命令完整列出，用户确认后才执行。
+#   场景与文档验证场景不同（比如每实例 8 卡）时，plan.md 顶部会告警：调优参数未在该场景验证过。
+# - 拓扑两种写法，二选一（同时写会报错）：
+#     A. [topology] 场景简写（默认）：写几 P 几 D、每实例几卡、用哪些节点，render.py 自动展开成实例、
+#        卡号、容器、端口。先 prefill 后 decode，按节点顺序依次占卡：
+#          cards < cards_per_node  一台放多个实例，卡号连续（0-3、4-7）；必须整除
+#          cards = cards_per_node  一实例一台
+#          cards > cards_per_node  实例跨 cards/cards_per_node 台（必须整除），每台用满全部卡，独占节点
+#        卡不够会报错并给出需要几台。没用到的节点在 plan.md 里列为“未使用”。
+#     B. 显式 [[prefill]] / [[decode]]：指定卡号 / 端口 / 实例级 env、args 时用（示例见“实例”一节的注释）。
+# - 并行参数的值可写 "@cards"，渲染时换成该实例总卡数（跨节点实例 = 节点数 × 每节点卡数）：
+#   模板里 prefill 的 tp-size、attn-cp-size，decode 的 tp-size、dp、ep 都用它；写数字则按数字。
+#   校验在替换后进行（tp-size 必须等于总卡数；dp/ep/attn-cp-size 不能大于总卡数）。
+# - 标 (派生) 的项由 agent 按拓扑自动计算，不要写进 [env.*] / [args.*]，写了会被拒绝：
+#     env : HIP_VISIBLE_DEVICES  NCCL_SOCKET_IFNAME  GLOO_SOCKET_IFNAME  NCCL_IB_HCA
+#           UCX_NET_DEVICES  MC_ALLOWED_IBV_DEVICES  SGLANG_TORCH_PROFILER_DIR
+#           MOONCAKE_LOCAL_HOSTNAME  MOONCAKE_TE_META_DATA_SERVER  MOONCAKE_MASTER
+#           MOONCAKE_GLOBAL_SEGMENT_SIZE   （MOONCAKE_* 只注入 prefill，与文档一致；decode 不设）
+#     args: --port --host --model-path --speculative-draft-model-path --served-model-name
+#           --dist-init-addr --nnodes --node-rank --deepep-config --disaggregation-mode
+#           --disaggregation-bootstrap-port --disaggregation-ib-device
+
+# ───────────────────────── 基本信息 ─────────────────────────
+[deploy]
+prefix = "dsv4flash"   # [必填] 容器/实例名前缀：<prefix>_prefill_<n>、<prefix>_decode_<n>
+
+# ───────────────────────── 节点 ─────────────────────────
+# 段名是本清单内部的节点别名，实例里用它引用。
+#   mcp_host : remote-linux MCP 里的节点名（宿主机，不是容器节点），agent 用它执行 docker 命令
+#   ip       : 节点间通信用的业务 IP（mooncake / router / bootstrap 都用它）
+#   network  : 选填，覆盖 [network] 的默认值（某台机器网卡名不同时用）
+[nodes.n1]
+mcp_host = "<mcp节点名1>"   # [必填]
+ip       = "10.208.194.7"   # [必填]
+
+[nodes.n2]
+mcp_host = "<mcp节点名2>"
+ip       = "10.208.194.17"
+# network = { socket_ifname = "eth1" }
+
+# ───────────────────────── 网络（所有节点默认值） ─────────────────────────
+# 派生规则：
+#   NCCL_SOCKET_IFNAME = GLOO_SOCKET_IFNAME = socket_ifname
+#   NCCL_IB_HCA = UCX_NET_DEVICES = "<dev>:<ib_port>,..."
+#   MC_ALLOWED_IBV_DEVICES = --disaggregation-ib-device = "<dev>,..."
+# 预检时 agent 会跑 ip a / ibv_devices / show_gids 核对，不一致会提示。
+[network]
+socket_ifname = "eth0"
+ib_devices    = ["mlx5_bond_0", "mlx5_bond_1", "mlx5_bond_2", "mlx5_bond_3"]
+ib_port       = 1
+
+# ───────────────────────── 镜像 ─────────────────────────
+[image]
+ref = "42.228.13.241:5000/jenkins/model_test_env/sglang:0.5.18-ubuntu22.04-dtk2604-py3.10-20260915-0302"   # [必填] 完整名或镜像 ID
+# if_not_present：节点上已有就跳过；always：每次都 pull；never：不 pull，没有就报错（ref 是镜像 ID 时只能用 never）
+pull_policy = "if_not_present"
+
+# ───────────────────────── 容器 ─────────────────────────
+# 每个实例一个容器，容器名 = 实例名。mooncake master 和 router 跑在 prefill_1 的容器里。
+# 生成的 docker run（基于已验证命令）：
+#   docker run -dit --network=host --name=<实例名> --privileged --device=/dev/kfd --device=/dev/dri
+#     --ipc=host --shm-size=<shm_size> --group-add video --cap-add=SYS_PTRACE
+#     --security-opt seccomp=unconfined -u root --ulimit stack=-1:-1 --ulimit memlock=-1:-1
+#     -v /opt/hyhal:/opt/hyhal:ro -v <work_dir>:<work_dir> -v <model_root>:/model:ro
+#     <extra_args...> <image.ref> /bin/bash
+[container]
+work_dir   = "/public/home/<用户名>"   # [必填] 宿主机工作目录，按相同路径挂进容器；脚本、日志、deepep 配置都放这里
+model_root = "/public/opendas"         # [必填] 宿主机模型根目录，只读挂到容器 /model
+shm_size   = "128G"
+extra_args = []                        # 选填，追加到 docker run 的参数，如 ["-v", "/data0:/data0"]
+# 同名容器已存在时：
+#   reuse    镜像和挂载与本清单一致就复用（已退出的先 docker start）；不一致则停下报告
+#   abort    停下报告
+#   recreate 删除重建（docker rm，执行前单独确认）
+on_conflict = "reuse"
+
+# ───────────────────────── 模型 ─────────────────────────
+[model]
+dir = "DeepSeek-V4-Flash-0731-Channel-FP8-w8a8"   # [必填] model_root 下的子目录；容器内路径 = /model/<dir>/
+# 对外模型名（--served-model-name）；留空取 dir 的最后一级目录名
+served_model_name = ""
+# deepep 配置：留空用 skill 自带的 deepep-config.json，上传到 <work_dir>/<prefix>/deepep-config.json；
+# 要用自己的文件就填容器内可见的绝对路径
+deepep_config = ""
+
+# ───────────────────────── 运行目录 ─────────────────────────
+# 脚本：<work_dir>/<prefix>/scripts/<实例名>.sh
+# 日志：<work_dir>/<prefix>/logs/<实例名>_<时间戳>.log
+# profiler：<work_dir>/<prefix>/profile（派生 SGLANG_TORCH_PROFILER_DIR；文档原值 /data0/... 未挂进容器）
+[run]
+startup_timeout_s = 3600   # 单实例等就绪的最长时间
+poll_interval_s   = 30
+card_busy_mem_pct = 5    # 卡检查：显存占用 % 超过此值，或卡上有进程，判 BUSY（DESIGN §6.7）
+
+# ───────────────────────── mooncake master（跑在 prefill_1 容器） ─────────────────────────
+# mooncake_master --enable_http_metadata_server=true --http_metadata_server_host=<prefill_1 节点 ip>
+#   --http_metadata_server_port=<metadata_port> --rpc_port=<rpc_port> <extra_args...>
+# 派生给 prefill：MOONCAKE_TE_META_DATA_SERVER=http://<ip>:<metadata_port>/metadata
+#                 MOONCAKE_MASTER=<ip>:<rpc_port>
+[mooncake]
+rpc_port      = 50051
+metadata_port = 8080
+segment_size  = "25GB"   # → 每个 prefill 的 MOONCAKE_GLOBAL_SEGMENT_SIZE
+extra_args    = []
+
+# ───────────────────────── router（跑在 prefill_1 容器） ─────────────────────────
+# python -m sglang_router.launch_router --pd-disaggregation
+#   --prefill http://<ip>:<port> <bootstrap_port>  （每个 prefill 一条）
+#   --decode  http://<ip>:<port>                   （每个 decode 一条）
+#   --host 0.0.0.0 --port <port> --prefill-policy <prefill_policy> <extra_args...>
+[router]
+port           = 30000
+prefill_policy = "round_robin"
+extra_args     = []
+
+# ───────────────────────── 拓扑（写法 A：场景简写，默认） ─────────────────────────
+# 实例名 <prefix>_prefill_<n> / <prefix>_decode_<n>，n 按展开顺序从 1 开始；prefill_1 的 rank0 容器跑 mooncake master 和 router。
+[topology]
+prefill        = 1          # prefill 实例数
+decode         = 1          # decode 实例数
+prefill_cards  = 8          # 每个 prefill 实例的卡数，默认 8
+decode_cards   = 8
+cards_per_node = 8          # 每台节点可用卡数，默认 8
+nodes          = ["n1", "n2"]   # 参与部署的节点（按顺序分配）；省略 = [nodes] 全部，按定义顺序
+
+# 例：3P1D，每实例 4 卡（文档验证场景）。需要 2 台：n1 放 prefill_1(0-3)、prefill_2(4-7)，n2 放 prefill_3(0-3)、decode_1(4-7)
+#   [topology]
+#   prefill = 3
+#   decode  = 1
+#   prefill_cards = 4
+#   decode_cards  = 4
+#   nodes = ["n1", "n2"]
+#
+# 例：跨节点实例，prefill 16 卡（跨 2 台，每台 8 卡）+ decode 8 卡，共需 3 台（先在 [nodes] 里加 n3）
+#   [topology]
+#   prefill = 1
+#   decode  = 1
+#   prefill_cards = 16
+#   decode_cards  = 8
+#   nodes = ["n1", "n2", "n3"]
+# 跨节点实例每个节点一个容器（同名）、一个脚本 <实例名>_r<rank>.sh，启动参数带 --nnodes / --node-rank，
+# --dist-init-addr 指向 rank0 节点 ip；HTTP / bootstrap / health 只在 rank0。
+
+# ───────────────────────── 端口自动分配 ─────────────────────────
+# 第 i 个实例（全局顺序，prefill 在前，从 0 起）：port = http_base + i，bootstrap_port = bootstrap_base + i，
+# dist_init_port = dist_init_base + i。全局唯一；与 mooncake / router 端口冲突会报错。
+[ports]
+http_base      = 10015
+bootstrap_base = 8998
+dist_init_base = 10749
+
+# ───────────────────────── 实例（写法 B：显式，与 [topology] 二选一） ─────────────────────────
+# 用户给了具体卡号 / 端口，或要给某个实例单独覆盖 env / args 时才用。用的话删掉上面的 [topology]，取消注释下面的段。
+# 编号 n 按数组顺序从 1 开始。同一节点上 cards 不能重叠；同一节点上所有端口不能重复（含 mooncake / router 端口）。
+#   node           : 实例所在节点别名；跨节点写 nodes = ["n3", "n4"]（每台用同一组 cards，rank 按列表顺序）
+#   cards          : 卡号 → HIP_VISIBLE_DEVICES（跨节点时是每台的卡）
+#   port / bootstrap_port / dist_init_port : 选填，写了就覆盖 [ports] 的自动分配
+#   env / args     : 选填，只对该实例生效，覆盖 [env.<role>] / [args.<role>]
+#
+# [[prefill]]
+# node = "n1"
+# cards = [0, 1, 2, 3]
+#
+# [[prefill]]
+# node = "n1"
+# cards = [4, 5, 6, 7]
+# port = 10016
+#
+# [[decode]]
+# node = "n2"
+# cards = [0, 1, 2, 3, 4, 5, 6, 7]
+# args = { "mem-fraction-static" = 0.78 }
+#
+# 跨节点 decode（16 卡，n3 + n4 各 8 卡）：
+# [[decode]]
+# nodes = ["n3", "n4"]
+# cards = [0, 1, 2, 3, 4, 5, 6, 7]
+
+# ───────────────────────── 环境变量默认值（文档原值） ─────────────────────────
+[env.prefill]
+NCCL_MIN_NCHANNELS = "16"
+NCCL_MAX_NCHANNELS = "16"
+SGLANG_OPT_USE_FUSED_STORE_CACHE = "false"
+SGLANG_OPT_USE_FUSED_HASH_TOPK = "true"
+SGLANG_OPT_SWIGLU_CLAMP_FUSION = "false"
+SGLANG_TOPK_TRANSFORM_512_TORCH = "false"
+SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = "true"
+SGLANG_JIT_DEEPGEMM_PRECOMPILE = "0"
+SGLANG_USE_AITER_AG = "0"
+ROCSHMEM_DISABLE_HDP_FLUSH = "1"
+ROCSHMEM_IB_GID_INDEX = "0"
+ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX = "288"
+ROCSHMEM_HEAP_SIZE = "3173741824"
+SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = "256"
+SGLANG_ROCM_USE_AITER_MOE = "1"
+SGLANG_USE_OPT_CAT = "1"
+SGLANG_USE_FUSED_MLA_CAT = "1"
+SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = "1"
+SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = "1"
+SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = "1"
+SGLANG_APPLY_CONFIG_BACKUP = "none"
+SGLANG_ROCM_USE_AITER_TILELANG_MHC = "1"
+SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = "1"
+SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = "1"
+SGLANG_USE_LIGHTOP = "1"
+SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = "1"
+SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = "1"
+SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = "1"
+SGLANG_USE_LIGHTOP_EP_MOE_ALIGN = "1"
+SGLANG_USE_LIGHTOP_EP_SCATTER = "1"
+SGLANG_USE_LIGHTOP_EP_GATHER = "1"
+SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS = "1"
+MC_ENABLE_DEST_DEVICE_AFFINITY = "1"
+SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = "1200"
+SGLANG_OPT_FP8_WO_A_GEMM = "0"
+SGLANG_RAGGED_VERIFY_MODE = "static"
+SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = "2"
+SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = "1"
+SGLANG_DSPARK_ENABLE_MULTI_STREAM = "1"
+SGLANG_DSPARK_FAST_KERNEL = "1"
+SGLANG_DSPARK_FAST_SAMPLING = "1"
+SGLANG_USE_FP8_W8A8_MOE = "1"
+SGLANG_USE_DEEPGEMM_MOE = "1"
+MOONCAKE_PROTOCOL = "rdma"
+MOONCAKE_CHECK_SERVER = "0"
+SGLANG_KV_LAYOUT_HCU_FA = "0"
+
+[env.decode]
+NCCL_MIN_NCHANNELS = "16"
+NCCL_MAX_NCHANNELS = "16"
+SGLANG_OPT_USE_FUSED_STORE_CACHE = "false"
+SGLANG_OPT_USE_FUSED_HASH_TOPK = "true"
+SGLANG_OPT_SWIGLU_CLAMP_FUSION = "false"
+SGLANG_TOPK_TRANSFORM_512_TORCH = "false"
+SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = "true"
+SGLANG_JIT_DEEPGEMM_PRECOMPILE = "0"
+SGLANG_USE_AITER_AG = "0"
+ROCSHMEM_DISABLE_HDP_FLUSH = "1"
+ROCSHMEM_IB_GID_INDEX = "0"
+ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX = "288"
+ROCSHMEM_HEAP_SIZE = "3173741824"
+SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = "512"   # DSPARK 抓图时每请求可能派发多个 draft token
+SGLANG_ROCM_USE_AITER_MOE = "1"
+SGLANG_USE_OPT_CAT = "1"
+SGLANG_USE_FUSED_MLA_CAT = "1"
+SGLANG_USE_LIGHTOP_GROUP_FP8_QUANT = "1"
+SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT = "1"
+SGLANG_USE_LINEAR_BF16_FP32_USE_BLASLT = "1"
+SGLANG_APPLY_CONFIG_BACKUP = "none"
+SGLANG_ROCM_USE_AITER_TILELANG_MHC = "1"
+SGLANG_DSV4_SPLIT_PREFILL_DECODE_MLA = "1"
+SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = "1"
+SGLANG_USE_LIGHTOP = "1"
+SGLANG_USE_DPSKV4_LIGHTOP_QUANT_K_CACHE = "1"
+SGLANG_USE_DPSKV4_LIGHTOP_RMSNORM = "1"
+SGLANG_USE_FUSED_DPSKV4_QNORM_ROPE_KV_ROPE_QUANT = "1"
+SGLANG_USE_LIGHTOP_EP_MOE_ALIGN = "1"
+SGLANG_USE_LIGHTOP_EP_SCATTER = "1"
+SGLANG_USE_LIGHTOP_EP_GATHER = "1"
+SGLANG_USE_LIGHTOP_TOPK_IDS_POSTPROCESS = "1"
+MC_ENABLE_DEST_DEVICE_AFFINITY = "1"
+SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = "1200"
+SGLANG_OPT_FP8_WO_A_GEMM = "0"
+SGLANG_RAGGED_VERIFY_MODE = "static"
+SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = "2"
+SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = "1"
+SGLANG_DSPARK_ENABLE_MULTI_STREAM = "1"
+SGLANG_DSPARK_FAST_KERNEL = "1"
+SGLANG_DSPARK_FAST_SAMPLING = "1"
+SGLANG_USE_FP8_W8A8_MOE = "1"
+SGLANG_USE_DEEPGEMM_MOE = "1"
+DEEPEP_ENABLE_LL_LAYERED_OPT = "1"
+
+# ───────────────────────── 启动参数默认值（文档原值） ─────────────────────────
+# 键是去掉 "--" 的参数名；true = 无值开关；false = 删除该参数；"@cards" = 实例总卡数；其余值原样拼在参数后面。
+[args.prefill]
+"reasoning-parser" = "deepseek-v4"
+"tool-call-parser" = "deepseekv4"
+"tp-size" = "@cards"
+"dist-timeout" = 10000
+"watchdog-timeout" = 3600
+"model-loader-extra-config" = '{"enable_multithread_load": "true","num_threads": 64}'
+"trust-remote-code" = true
+"chunked-prefill-size" = 32768
+"disable-flashinfer-autotune" = true
+"skip-server-warmup" = true
+"cuda-graph-max-bs" = 256
+"mem-fraction-static" = 0.8
+"kv-cache-dtype" = "fp8_e4m3"
+"speculative-algorithm" = "DSPARK"
+"speculative-num-steps" = 1
+"speculative-eagle-topk" = 1
+"speculative-num-draft-tokens" = 6
+"max-running-requests" = 256
+"context-length" = 262144
+"disable-cuda-graph" = true
+"speculative-moe-a2a-backend" = "none"
+"enable-cache-report" = true
+"enable-metrics" = true
+"enable-prefill-cp" = true
+"cp-strategy" = "interleave"
+"dp" = 1
+"attn-cp-size" = "@cards"
+"enable-dp-attention" = true
+"moe-a2a-backend" = "deepep"
+"deepep-mode" = "auto"
+"moe-runner-backend" = "deep_gemm"
+"disaggregation-transfer-backend" = "mooncake"
+"enable-hierarchical-cache" = true      # 缺了它 mooncake 分配为 0（见文档 FAQ 1）
+"hicache-ratio" = 3
+"enable-two-batch-overlap" = true
+"hicache-mem-layout" = "page_first"
+"hicache-io-backend" = "kernel"
+"hicache-write-policy" = "write_back"
+"hicache-storage-backend" = "mooncake"
+"hicache-storage-prefetch-policy" = "timeout"
+
+[args.decode]
+"reasoning-parser" = "deepseek-v4"
+"tool-call-parser" = "deepseekv4"
+"tp-size" = "@cards"
+"dist-timeout" = 10000
+"watchdog-timeout" = 3600
+"model-loader-extra-config" = '{"enable_multithread_load": "true","num_threads": 64}'
+"trust-remote-code" = true
+"chunked-prefill-size" = 32768
+"disable-flashinfer-autotune" = true
+"cuda-graph-max-bs-decode" = 256
+"skip-server-warmup" = true
+"mem-fraction-static" = 0.8
+"speculative-algorithm" = "DSPARK"
+"speculative-num-steps" = 1
+"speculative-eagle-topk" = 1
+"speculative-num-draft-tokens" = 6
+"max-running-requests" = 256
+"context-length" = 262144
+"kv-cache-dtype" = "fp8_e4m3"
+"dp" = "@cards"
+"enable-cache-report" = true
+"enable-dp-attention" = true
+"enable-dp-lm-head" = true
+"ep" = "@cards"
+"moe-a2a-backend" = "deepep"
+"moe-runner-backend" = "deep_gemm"
+"deepep-mode" = "auto"
+"speculative-moe-a2a-backend" = "deepep"
+"speculative-moe-runner-backend" = "deep_gemm"
+"enable-metrics" = true
+"disaggregation-transfer-backend" = "mooncake"
