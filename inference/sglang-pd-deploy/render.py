@@ -1663,6 +1663,30 @@ def component_cmds(cfg: Config, container: str, name: str, ready_port: int | Non
     }
 
 
+# Prints flush_ok / flush_bad: <why> / flush_unverified: <why>; response fields differ across router versions.
+FLUSH_CHECK = r"""r=$(curl -sS -X POST -m 30 -w '\n%{{http_code}}' {url}/flush_cache 2>&1); echo "${{r%$'\n'*}}"
+python - "${{r##*$'\n'}}" {expected} "${{r%$'\n'*}}" <<'PY'
+import json, sys
+code, exp, body = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    d = json.loads(body)
+except ValueError:
+    d = None
+if code != "200":
+    print(f"flush_bad: HTTP {{code}}")
+elif not isinstance(d, dict):
+    print("flush_bad: response is not a JSON object")
+elif d.get("failed"):
+    print(f"flush_bad: failed={{d['failed']}}")
+elif d.get("workers_flushed") is None:
+    print("flush_unverified: no workers_flushed field, check body against expected {expected} workers")
+elif d["workers_flushed"] != exp:
+    print(f"flush_bad: workers_flushed={{d['workers_flushed']}} expected={{exp}}")
+else:
+    print("flush_ok")
+PY"""
+
+
 def health_cmd(container: str, ip: str, port: int) -> str:
     return dexec(container, f"curl -s -o /dev/null -w '%{{http_code}}' -m 5 http://{ip}:{port}/health")
 
@@ -1800,6 +1824,7 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
         "health_cmd": health_cmd(p1.name, p1node.ip, cfg.router_port),
         "flush_cache_cmd": (f"docker exec {q(p1.name)} bash -lc "
                             f"{q(f'curl -sS -X POST -m 30 {url}/flush_cache')}"),
+        "flush_cache_check_cmd": dexec(p1.name, FLUSH_CHECK.format(url=url, expected=len(cfg.instances))),
         "expected_workers": len(cfg.instances),
         "workers_check_cmd": dexec(p1.name, (
             f"b=$(curl -s -m 5 {url}/workers; curl -s -m 5 {url}/list_workers); miss=; "
