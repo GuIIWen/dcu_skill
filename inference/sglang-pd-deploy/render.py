@@ -1663,6 +1663,20 @@ def component_cmds(cfg: Config, container: str, name: str, ready_port: int | Non
     }
 
 
+# Prints the body, then "<http code> ok" or "<http code> failed=<any non-empty *fail* field>".
+FLUSH_CHECK = r"""r=$(curl -s -X POST -m 30 -w '\n%{{http_code}}' {url}/flush_cache); echo "${{r%$'\n'*}}"
+python - "${{r##*$'\n'}}" "${{r%$'\n'*}}" <<'PY'
+import json, sys
+code, body = sys.argv[1:]
+try:
+    d = json.loads(body)
+except ValueError:
+    d = None
+fails = {{k: v for k, v in d.items() if "fail" in k.lower() and v}} if isinstance(d, dict) else {{}}
+print(code, f"failed={{fails}}" if fails else ("ok" if code == "200" else "bad"))
+PY"""
+
+
 def health_cmd(container: str, ip: str, port: int) -> str:
     return dexec(container, f"curl -s -o /dev/null -w '%{{http_code}}' -m 5 http://{ip}:{port}/health")
 
@@ -1800,7 +1814,7 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
         "health_cmd": health_cmd(p1.name, p1node.ip, cfg.router_port),
         "flush_cache_cmd": (f"docker exec {q(p1.name)} bash -lc "
                             f"{q(f'curl -sS -X POST -m 30 {url}/flush_cache')}"),
-        "flush_cache_check_cmd": dexec(p1.name, f"curl -s -o /dev/null -w '%{{http_code}}' -X POST -m 30 {url}/flush_cache"),
+        "flush_cache_check_cmd": dexec(p1.name, FLUSH_CHECK.format(url=url)),
         "expected_workers": len(cfg.instances),
         "workers_check_cmd": dexec(p1.name, (
             f"b=$(curl -s -m 5 {url}/workers; curl -s -m 5 {url}/list_workers); miss=; "
