@@ -1,0 +1,7 @@
+- name: openai/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+  extra_params:
+    timeout: 600
+    max_retries: 0
+    extra_body:
+      chat_template_kwargs:
+        thinking: true

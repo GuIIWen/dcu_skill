@@ -1,0 +1,10 @@
+# 思考开 + 请求超时 600s + 不让 openai 客户端自己重试 + temperature=1
+# temperature 写在 extra_params 里: aider 先设 temperature=0, 之后 kwargs.update(extra_params) 会覆盖它
+- name: openai/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+  extra_params:
+    timeout: 600
+    max_retries: 0
+    temperature: 1
+    extra_body:
+      chat_template_kwargs:
+        thinking: true
