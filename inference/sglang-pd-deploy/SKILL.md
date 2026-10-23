@@ -168,7 +168,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 3. `mooncake.mem_cmd` 显示的总量 = `mooncake.expected_total`（master 日志每 10 秒左右刷新一次，没出现就等一会再查）。为 0 时同上排查。
 4. `final_curl_validate_batch_cmd`（在 prefill_1 rank0 容器内执行，经 MCP 发到该容器所在宿主机，`timeout=660`）按 prefill 实例数发送请求；命令会解析每个 JSON 响应，并强制检查 `choices[0].message` 有非空 `content` 或 `reasoning_content`。同时检查 router 日志，确认请求按 `round_robin` 覆盖每个 prefill；`final_curl_batch_cmd` 仅用于需要保留原始响应的调试。把响应和路由覆盖摘要给用户。
 
-5. `router.flush_cache_check_cmd`（final curl 通过后执行）：调用 router 的 `POST /flush_cache`，原样打印响应，最后一行必须是 `flush_ok`（HTTP 200、无失败 worker、`workers_flushed` = 后端数量）。`flush_bad: ...` → 部署不算成功，按原因排查（HTTP 404 说明这版 router 不支持，改为按实例逐个调后端 `POST /flush_cache` 核对 200；workers_flushed 偏少 → 跑 `router.workers_check_cmd` 看谁没注册）。`flush_unverified: ...` → 这版 router 响应没有 `workers_flushed`，把响应体给用户，人工核对后端数量。
+5. `router.flush_cache_check_cmd`（final curl 通过后执行）：调用 router 的 `POST /flush_cache`，输出 HTTP 状态码，必须是 `200`。不是 200 → 部署不算成功，把状态码报给用户（`000` = 连不上 router，`404` = 这版 router 不支持 flush_cache）。
 
 成功后汇报：对外地址（`router.url` + `/v1`）、模型名、各组件日志路径（`<deploy_dir>/logs/<名字>.log` 是指向最新日志的软链）、停服方法。
 
