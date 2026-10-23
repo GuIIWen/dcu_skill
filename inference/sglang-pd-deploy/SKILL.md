@@ -152,6 +152,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
      1. rank0 member 的 `ready_cmd` 输出 `ready`（本次日志出现 `The server is fired up and ready to roll!`）。rank>0 member 的 `ready_cmd` 为 `null`：sglang 在 node_rank≥1 上不做 warmup、不打印该行，rank>0 只看 `alive_cmd` 和错误扫描；rank0 ready 已隐含所有 rank 初始化完成。
      2. 实例顶层 `listen_check_cmd` 输出 `listening`（rank0 HTTP 端口在监听）。
      3. 实例顶层 `health_cmd` = `200`。sglang 在 warmup 完成前 `/health` 返回 503，PD 模式下 health 用假 bootstrap，不依赖 router；router 自己也只在 worker `/health` 200 后才注册它，所以这一项不会和 router 互相等。
+   - **前两项都满足后才开始查 `health_cmd`**，在 ready 之前不要探 `/health`。`/health` 会在 prefill 里塞一个真请求；首次启动现编 JIT 时它可能要十几秒，`health_cmd` 的 curl 超时（30s）比服务端的 20s 长，不能自己改短，也不能用 `-m 5` 之类的手写 curl 代替：客户端先断开会让这个请求永久卡在 prefill 的 inflight 队列里，之后 `flush_cache` 一直失败（见排障）。
    - 超时（`startup_timeout_s`）前任一实例没就绪就按失败处理，**绝不能**因为等太久就先起 router 试试。
    - 每轮同时执行 `warning_scan_cmd`；它只报告已知的 `multimem all-gather disabled` 告警。该告警不计入 `error_scan_cmd` 的致命错误，但要在最终报告中注明。
 5. **router**：所有 prefill/decode 实例按上面三项全部就绪后，才执行 `router.launch_cmd`。router 脚本本身还有一道门：启动前逐个等所有 worker 的 `/health` 到 200（超时 `startup_timeout_s`），没等到就在 router 日志写 `router gate: ... router not started` 并退出（`alive_cmd` 变 `dead`），不会提前对外服务。router 在等这道门时 `health_cmd` 不是 200，属正常。
@@ -168,7 +169,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 3. `mooncake.mem_cmd` 显示的总量 = `mooncake.expected_total`（master 日志每 10 秒左右刷新一次，没出现就等一会再查）。为 0 时同上排查。
 4. `final_curl_validate_batch_cmd`（在 prefill_1 rank0 容器内执行，经 MCP 发到该容器所在宿主机，`timeout=660`）按 prefill 实例数发送请求；命令会解析每个 JSON 响应，并强制检查 `choices[0].message` 有非空 `content` 或 `reasoning_content`。同时检查 router 日志，确认请求按 `round_robin` 覆盖每个 prefill；`final_curl_batch_cmd` 仅用于需要保留原始响应的调试。把响应和路由覆盖摘要给用户。
 
-5. `router.flush_cache_check_cmd`（final curl 通过后执行）：调用 router 的 `POST /flush_cache`，先打印响应体，最后一行是 `<状态码> ok` / `<状态码> failed=<...>` / `<状态码> bad`。必须是 `200 ok`（状态码 200，且响应里没有非空的 fail 类字段，如 `failed`）。否则部署不算成功，把最后一行和响应体报给用户：`failed=` 列出刷新失败的 worker 及原因；`000` = 连不上 router；`404` = 这版 router 不支持 flush_cache。
+5. `router.flush_cache_check_cmd`（final curl 通过后执行）：调用 router 的 `POST /flush_cache`，先打印响应体，最后一行是 `<状态码> ok` / `<状态码> failed=<...>` / `<状态码> bad`。必须是 `200 ok`（状态码 200，且响应里没有非空的 fail 类字段，如 `failed`）。否则部署不算成功，把最后一行和响应体报给用户：`failed=` 列出刷新失败的 worker 及原因（prefill `HTTP 400` 且日志是 `pending requests` 但队列为 0 的，按排障表重启该实例）；`000` = 连不上 router；`404` = 这版 router 不支持 flush_cache。
 
 成功后汇报：对外地址（`router.url` + `/v1`）、模型名、各组件日志路径（`<deploy_dir>/logs/<名字>.log` 是指向最新日志的软链）、停服方法。
 
@@ -195,6 +196,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 | RDMA / rocshmem 初始化失败 | 跑 `diag_cmd`，看 GID 信息：`ROCSHMEM_IB_GID_INDEX`（默认 0）应指向 RoCE v2 + IPv4 的 index；核对 `ib_devices` 与实际 IB 设备 |
 | 请求一直不返回 / 卡在 prefill 或 decode 队列 | 多半是 router 在 worker 就绪前就收到了请求。先 `stop_cmd` 停 router，按 `stop_order` 停掉并重启所有 prefill/decode，按第 8 步三项就绪判据等全部实例就绪，再起 router、等 `workers_check_cmd` = `registered` 后再发请求 |
 | router 日志 `router gate: ... not 200 ... router not started` | 对应 worker 在超时内没就绪：查该实例 rank0 日志和 `error_scan_cmd`，修好后重新起 router |
+| `flush_cache` 返回非 `200 ok`，某个 prefill 报 `HTTP 400`，其日志有 `Cache not flushed because there are pending requests. #queue-req: 0, #running-req: 0`、`Prefill batch` 行的 `#inflight-req` 一直不为 0 | 有 `/health` 请求在客户端超时后卡在 inflight 队列（通常是启动期用了过短的 curl 超时）。只对该实例的所有 members 跑 `stop_cmd` 再 `launch_cmd`，按第 8 步第 4 点等就绪（JIT 已有缓存，这次会快），再跑 `flush_cache_check_cmd`；router 和其它实例不用重启 |
 | `Address already in use` | 端口被别的进程占了；换端口重新渲染 |
 | `already running` | 该 member 的 pid 文件指向的进程还活着；先对它跑 `stop_cmd` |
 | 跨节点实例卡在 `dist-init` / 等其它 rank | 确认所有 member 都已启动；核对 `--dist-init-addr`（rank0 节点 ip + `dist_init_port`）在各节点上可达、端口未被占 |

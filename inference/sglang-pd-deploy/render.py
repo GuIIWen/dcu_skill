@@ -54,6 +54,9 @@ ERROR_PATTERN = ("Traceback|RuntimeError|out of memory|OutOfMemory|HIP error|CUD
                  "Segmentation fault|core dumped|Address already in use|Killed")
 KNOWN_NONFATAL_ERROR_PATTERN = "multimem all-gather disabled"
 SERVER_READY_MARKER = "The server is fired up and ready to roll!"
+# /health 会在 PD prefill 里塞一个真请求，服务端最多等 SGLANG_HEALTH_CHECK_TIMEOUT（默认 20s）；
+# 客户端先超时断开会让这个请求卡在 prefill inflight 队列，之后 flush_cache 一直 400，所以必须 > 20
+HEALTH_CURL_TIMEOUT_S = 30
 SERVER_CMD = "sglang serve"
 ROUTER_CMD = "python -m sglang_router.launch_router"
 TOOLS_CHECK = 'command -v sglang curl; python -c "import sglang_router" && echo router_ok'
@@ -967,7 +970,7 @@ def router_gate(cfg: Config) -> str:
     # The gateway itself only registers a worker after its /health is 200, so this cannot deadlock.
     return f"""DEADLINE=$((SECONDS + {t}))
 for u in {' '.join(worker_urls(cfg))}; do
-  until [[ $(curl -s -o /dev/null -w '%{{http_code}}' -m 5 "$u/health") == 200 ]]; do
+  until [[ $(curl -s -o /dev/null -w '%{{http_code}}' -m {HEALTH_CURL_TIMEOUT_S} "$u/health") == 200 ]]; do
     if (( SECONDS >= DEADLINE )); then echo "router gate: $u/health not 200 after {t}s, router not started"; exit 1; fi
     sleep 5
   done
@@ -1678,7 +1681,7 @@ PY"""
 
 
 def health_cmd(container: str, ip: str, port: int) -> str:
-    return dexec(container, f"curl -s -o /dev/null -w '%{{http_code}}' -m 5 http://{ip}:{port}/health")
+    return dexec(container, f"curl -s -o /dev/null -w '%{{http_code}}' -m {HEALTH_CURL_TIMEOUT_S} http://{ip}:{port}/health")
 
 
 LISTEN_CHECK = (
