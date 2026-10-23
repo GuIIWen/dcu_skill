@@ -77,7 +77,7 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
    - `cards_check_cmd` 会先在宿主机 shell 中 `source /opt/hyhal/env.sh`（文件存在时），再查 `hy-smi`/`rocm-smi`；不要用其它容器里的工具代替，也不要用 `fuser` 作为卡状态结论。
    - 任一卡 `BUSY` → 停下，报告节点、卡号、显存占用和占用进程；不停别人的进程，让用户换卡/换节点或自行释放后重来。
    - `UNKNOWN`（没有 hy-smi/rocm-smi 或解析失败）→ 把原始输出给用户，由用户确认这些卡空闲后才继续。
-3. **预检（子 agent）**：卡全部空闲后，起一个只读子 agent，对每个节点跑 `preflight_cmd`（`timeout=120`）并返回全部 `CHECK` 行。预检是最小化检查：docker 可用、`Driver`/`DockerRootDir`/`DriverStatus`（检测到 `Driver=containerd`、containerd image store 或 `io.containerd.snapshotter` 直接 FAIL）、镜像、同名容器、端口占用、模型 `config.json`、work_dir 可写。网卡/IB、GID、内存等在 `diag_cmd` 里，只在服务起不来或用户要求时跑。主流程同时整理 plan.md 要点，准备第 3 步。
+3. **预检（子 agent）**：卡全部空闲后，起一个只读子 agent，对每个节点跑 `preflight_cmd`（`timeout=120`）并返回全部 `CHECK` 行。预检是最小化检查：docker 可用、镜像存储位置（普通模式看 `DockerRootDir`；containerd image store / `io.containerd.snapshotter` 模式看 `/etc/containerd/config.toml` 的 `root`，缺省 `/var/lib/containerd`；与 `/` 同一文件系统即在系统盘，直接 FAIL）、镜像、同名容器、端口占用、模型 `config.json`、work_dir 可写。网卡/IB、GID、内存等在 `diag_cmd` 里，只在服务起不来或用户要求时跑。主流程同时整理 plan.md 要点，准备第 3 步。
 4. 处理预检结果：
    - `FAIL`：停下，告诉用户原因和建议（比如端口被占就建议换端口），改 deploy.toml 后从第 2 步重来。
    - `WARN`：在第 3 步汇总里列出。
@@ -148,9 +148,14 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
    - 任一 member 的 `alive_cmd` 为 `dead` → 失败；`alive_cmd` 检查 leader PID，不能只依赖负 PGID；端口监听和 ready marker 仍需分别核对；
    - 任一 member 的 `error_scan_cmd` 命中致命错误，或 member `log` 最后 100 行出现 `Traceback`、异常退出、OOM、端口占用 → 失败；
    - `multimem all-gather disabled` 伴随 `CUDA error: invalid argument` 是当前镜像已观察到的非致命告警；只要进程仍 alive 且 ready，继续启动并在验收报告中注明；
-   - `ready_cmd` 是 member 级判据：所有 rank 都必须在本次日志中看到 `The server is fired up and ready to roll!` 并输出 `ready`；端口监听只作为单独的 `listen_check_cmd`，不能代替 ready marker。所有 members 的 `ready_cmd` 都必须通过，且实例顶层 `listen_check_cmd` 输出 `listening` 后才算实例就绪。不能把“进程还活着”或“端口已监听”当作 ready。启动阶段不要把实例 `/health` 200 当作 router 启动前置条件，PD worker 的 health 可能要等 router 注册后才返回 200。
+   - 实例就绪 = 以下三项**全部**满足，缺一不可，不能把“进程还活着”或“端口已监听”当作就绪：
+     1. rank0 member 的 `ready_cmd` 输出 `ready`（本次日志出现 `The server is fired up and ready to roll!`）。rank>0 member 的 `ready_cmd` 为 `null`：sglang 在 node_rank≥1 上不做 warmup、不打印该行，rank>0 只看 `alive_cmd` 和错误扫描；rank0 ready 已隐含所有 rank 初始化完成。
+     2. 实例顶层 `listen_check_cmd` 输出 `listening`（rank0 HTTP 端口在监听）。
+     3. 实例顶层 `health_cmd` = `200`。sglang 在 warmup 完成前 `/health` 返回 503，PD 模式下 health 用假 bootstrap，不依赖 router；router 自己也只在 worker `/health` 200 后才注册它，所以这一项不会和 router 互相等。
+   - 超时（`startup_timeout_s`）前任一实例没就绪就按失败处理，**绝不能**因为等太久就先起 router 试试。
    - 每轮同时执行 `warning_scan_cmd`；它只报告已知的 `multimem all-gather disabled` 告警。该告警不计入 `error_scan_cmd` 的致命错误，但要在最终报告中注明。
-5. **router**：所有 prefill/decode 的 members ready 后执行 `router.launch_cmd`，轮询 `router.health_cmd` 到 `200`（最多约 5 分钟）。router health 通过后，才轮询所有 prefill/decode 的 `health_cmd` 到 `200`，然后执行第 9 步最终推理验收。
+5. **router**：所有 prefill/decode 实例按上面三项全部就绪后，才执行 `router.launch_cmd`。router 脚本本身还有一道门：启动前逐个等所有 worker 的 `/health` 到 200（超时 `startup_timeout_s`），没等到就在 router 日志写 `router gate: ... router not started` 并退出（`alive_cmd` 变 `dead`），不会提前对外服务。router 在等这道门时 `health_cmd` 不是 200，属正常。
+   然后轮询 `router.health_cmd` 到 `200`，再轮询 `router.workers_check_cmd` 直到输出 `registered`（router health 200 只代表 router 进程活着，worker 是异步注册的；输出 `missing: <url>` 说明还没注册完，继续等，最多约 5 分钟）。两项都通过才执行第 9 步最终推理验收；在此之前**不得**向 router 发任何推理请求——worker 未注册或未就绪时进来的请求会卡在节点队列里，只能重启实例恢复。
 
 任何一步失败：按 `stop_order` 对已启动的组件跑 `stop_cmd`（实例要停掉其全部 members），保留容器，报告。
 
@@ -186,6 +191,8 @@ description: 用 remote-linux MCP 在指定节点上自动部署 sglang PD 分�
 | mooncake `Mem Storage` 为 0 / prefill 日志没有 `Mooncake store setup successfully` | 文档 FAQ 1：缺 `--enable-hierarchical-cache`；或 `MOONCAKE_MASTER`/metadata 地址不通（在 prefill 容器里 `docker exec <容器> curl http://<p1 ip>:<metadata_port>/metadata`） |
 | 服务起不来，需要看硬件 / 网络 | 对相关节点跑 `nodes[].diag_cmd`（只读）：卡占用、网卡、IB 设备与端口状态、GID、内存。按需执行，不要在部署前例行跑 |
 | RDMA / rocshmem 初始化失败 | 跑 `diag_cmd`，看 GID 信息：`ROCSHMEM_IB_GID_INDEX`（默认 0）应指向 RoCE v2 + IPv4 的 index；核对 `ib_devices` 与实际 IB 设备 |
+| 请求一直不返回 / 卡在 prefill 或 decode 队列 | 多半是 router 在 worker 就绪前就收到了请求。先 `stop_cmd` 停 router，按 `stop_order` 停掉并重启所有 prefill/decode，按第 8 步三项就绪判据等全部实例就绪，再起 router、等 `workers_check_cmd` = `registered` 后再发请求 |
+| router 日志 `router gate: ... not 200 ... router not started` | 对应 worker 在超时内没就绪：查该实例 rank0 日志和 `error_scan_cmd`，修好后重新起 router |
 | `Address already in use` | 端口被别的进程占了；换端口重新渲染 |
 | `already running` | 该 member 的 pid 文件指向的进程还活着；先对它跑 `stop_cmd` |
 | 跨节点实例卡在 `dist-init` / 等其它 rank | 确认所有 member 都已启动；核对 `--dist-init-addr`（rank0 节点 ip + `dist_init_port`）在各节点上可达、端口未被占 |

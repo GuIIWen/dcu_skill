@@ -956,6 +956,26 @@ def router_args(cfg: Config) -> list:
     return out + [q(a) for a in cfg.router_extra]
 
 
+def worker_urls(cfg: Config) -> list:
+    return [f"http://{cfg.node_of(i.rank0).ip}:{i.port}" for i in cfg.prefills + cfg.decodes]
+
+
+def router_gate(cfg: Config) -> str:
+    """router 脚本前置：所有 worker /health 200 才 exec router。"""
+    t = cfg.startup_timeout_s
+    # Requests routed before a worker is up hang in that worker's queue and need a full restart.
+    # The gateway itself only registers a worker after its /health is 200, so this cannot deadlock.
+    return f"""DEADLINE=$((SECONDS + {t}))
+for u in {' '.join(worker_urls(cfg))}; do
+  until [[ $(curl -s -o /dev/null -w '%{{http_code}}' -m 5 "$u/health") == 200 ]]; do
+    if (( SECONDS >= DEADLINE )); then echo "router gate: $u/health not 200 after {t}s, router not started"; exit 1; fi
+    sleep 5
+  done
+  echo "router gate: $u healthy"
+done
+"""
+
+
 def launcher_body(env_items: list, cmd: str, args: list) -> str:
     """脚本里 cd 之后的部分：export 行 + exec 命令（每个参数一行）。"""
     lines = [f"export {k}={q(v)}" for k, v in env_items]
@@ -1183,9 +1203,24 @@ def preflight_script(cfg: Config, node: Node) -> str:
         "  DOCKER_OK=1",
         "  if storage=$(to 20 docker info --format 'driver={{.Driver}} root={{.DockerRootDir}} status={{json .DriverStatus}}' 2>&1); then",
         '    emit INFO docker-storage "$storage"',
+        "    IMG_STORE=${storage#*root=}",
+        "    IMG_STORE=${IMG_STORE%% status=*}",
         '    case "$storage" in',
-        '      driver=containerd*|*io.containerd.snapshotter*|*"containerd image store"*) emit FAIL docker-storage "containerd image store detected; verify Docker data-root before deployment" ;;',
+        '      driver=containerd*|*io.containerd.snapshotter*|*"containerd image store"*)',
+        "        # containerd image store keeps layers under containerd's root, not Docker data-root",
+        "        # shortcut: reads only /etc/containerd/config.toml (containerd.io service), not a dockerd-managed containerd",
+        r"""        IMG_STORE=$(awk -F"[\"']" '/^\[/{exit} /^[[:space:]]*root[[:space:]]*=/{print $2; exit}' /etc/containerd/config.toml 2>/dev/null)""",
+        "        IMG_STORE=${IMG_STORE:-/var/lib/containerd} ;;",
         "    esac",
+        "    # shortcut: system disk = same filesystem as /, a separate /var partition on the system disk passes",
+        """    STORE_MNT=$(df -P "$IMG_STORE" 2>/dev/null | awk 'NR==2 {print $6}')""",
+        "    if [[ -z $STORE_MNT ]]; then",
+        '      emit WARN docker-storage "cannot resolve filesystem of image store $IMG_STORE"',
+        "    elif [[ $STORE_MNT == / ]]; then",
+        '      emit FAIL docker-storage "image store $IMG_STORE is on the system disk (/); move images to a data disk (set data-root, disable containerd-snapshotter)"',
+        "    else",
+        '      emit OK docker-storage "image store $IMG_STORE on $STORE_MNT"',
+        "    fi",
         "  else",
         '    emit WARN docker-storage "docker info storage fields unavailable: $(printf \'%s\' "$storage" | head -n 1)"',
         "  fi",
@@ -1726,6 +1761,8 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
                 "write_check_cmd": dexec(c, write_inner),
             })
             cmds = component_cmds(cfg, c, m.name, i.port if m.rank == 0 else None)
+            if m.rank != 0:  # node_rank >= 1 skips warmup and never logs the ready marker; rank0 ready covers it
+                cmds["ready_cmd"] = None
             members.append({
                 "rank": m.rank, "node": node.alias, "mcp_host": node.mcp_host, "ip": node.ip,
                 "cards": m.cards, **cmds,
@@ -1764,6 +1801,11 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
         "flush_cache_cmd": (f"docker exec {q(p1.name)} bash -lc "
                             f"{q(f'curl -sS -X POST -m 30 {url}/flush_cache')}"),
         "expected_workers": len(cfg.instances),
+        "workers_check_cmd": dexec(p1.name, (
+            f"b=$(curl -s -m 5 {url}/workers; curl -s -m 5 {url}/list_workers); miss=; "
+            f"for u in {' '.join(worker_urls(cfg))}; do "
+            'grep -qF "$u" <<<"$b" || miss="$miss $u"; done; '
+            '[[ -z $miss ]] && echo registered || echo "missing:$miss"')),
         "error_scan_cmd": rt["error_scan_cmd"],
         "warning_scan_cmd": rt["warning_scan_cmd"],
     }
@@ -1914,8 +1956,8 @@ def plan_md(cfg: Config, out: Path, warnings: list, bodies: dict, plan: dict) ->
         for u in nd["uploads"]:
             L.append(f"| {nd['mcp_host']} | `{u['local']}` | `{u['remote']}` |")
     L += ["",
-          "5. 启动顺序：上传脚本后先把 params.md（各实例最终 env 与启动命令）交给用户确认；确认后先 mooncake master，再同时启动所有 prefill 和 decode members；轮询 alive_cmd、ready_cmd 和端口监听，全部 members ready 后再启动 router，最后验收。",
-          "启动阶段不把实例 health 200 作为 router 启动前置条件；PD worker 可能要等 router 注册后才返回 200。跨节点实例的所有 members 必须同时启动；health 只查 rank0。",
+          "5. 启动顺序：上传脚本后先把 params.md（各实例最终 env 与启动命令）交给用户确认；确认后先 mooncake master，再同时启动所有 prefill 和 decode members；轮询 alive_cmd、rank0 ready_cmd、端口监听和实例 /health，全部实例 /health 200 后再启动 router（router 脚本自身也会等所有 worker /health 200 才启动），router health 200 且 workers_check_cmd 输出 registered 后才验收。",
+          "跨节点实例的所有 members 必须同时启动；ready marker 和 health 只查 rank0（rank>0 不打印 ready marker）。",
           "   跨节点实例的每个 member（每个节点的容器/脚本）同时启动；`/health` 只查 rank0。",
           "6. 验收：各实例 `/health`；prefill 每个 member 日志 `Mooncake store setup successfully` 行数 = 该 member 卡数；"
           f"mooncake `Mem Storage` = `{cfg.expected_total}`；运行 `final_curl_batch_cmd`（每个 prefill 一次请求），并结合 router 日志确认 round-robin 覆盖每个 prefill。", ""]
@@ -1995,7 +2037,7 @@ def generate(cfg: Config, out: Path, warnings: list) -> Path:
     bodies["mooncake_master"] = launcher_body([], "mooncake_master", mooncake_args(cfg))
     scripts["mooncake_master"] = launcher_script(cfg, "mooncake_master", bodies["mooncake_master"])
     bodies["router"] = launcher_body([], ROUTER_CMD, router_args(cfg))
-    scripts["router"] = launcher_script(cfg, "router", bodies["router"])
+    scripts["router"] = launcher_script(cfg, "router", router_gate(cfg) + bodies["router"])
     scripts["stop"] = stop_script(cfg)
     preflights = {n.alias: preflight_script(cfg, n) for n in cfg.used_nodes}
     diags = {n.alias: diag_script(cfg, n) for n in cfg.used_nodes}
