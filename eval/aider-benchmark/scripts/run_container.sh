@@ -6,9 +6,9 @@ set -euo pipefail
 
 IMAGE="${AIDER_IMAGE:-aider_run:latest}"
 NAME="${CONTAINER_NAME:-aider_run_c}"
-AIDER_DIR="${AIDER_DIR:-/data0/songjiajun/aider/aider}"        # aider 仓库: benchmark/ 目录和 aider 代码都在这里
+AIDER_DIR="${AIDER_DIR:?set AIDER_DIR to the host aider repository}"  # 必填；benchmark/ 目录和 aider 代码都在这里
 BENCH_DIR="${BENCH_DIR:-${AIDER_DIR}/tmp.benchmarks}"     # 习题数据集 polyglot-benchmark + 全部结果目录
-API_BASE="${OPENAI_API_BASE:-http://10.208.194.7:30000/v1}"
+API_BASE="${OPENAI_API_BASE:?set OPENAI_API_BASE to the confirmed service URL, ending in /v1}"
 API_KEY="${OPENAI_API_KEY:-EMPTY}"
 MEM="${MEMORY:-12g}"
 

@@ -9,7 +9,7 @@ description: 用 remote-linux MCP 在 GPU/DCU 节点的容器里安装并运行 
 
 - 只覆盖 aider 仓库 `5dc9490bb`（v0.86.3.dev53）自带的 `benchmark/benchmark.py` 和 polyglot-benchmark 数据集（225 题：cpp 26、go 39、java 47、javascript 49、python 34、rust 30）。其他 aider 版本、其他 benchmark 不适用。
 - 对接的模型服务是 OpenAI 兼容接口（本环境是 sglang PD 分离部署的 DeepSeek-V4-Flash，经 router 的 `:30000/v1`）。
-- 运行环境：Ubuntu 22.04 容器（镜像 `aider_run`），宿主机是 Hygon DCU 节点（tencent05/06）。
+- 运行环境：Ubuntu 22.04 容器（镜像 `aider_run`），宿主机是 Hygon DCU 节点（node-A/node-B）。
 - 依赖 remote-linux MCP 的 `exec`、`write_file`、`read_file`。下文 `<SKILL>` 是本 skill 目录，里面有 `scripts/`、`configs/`、`repro/`、`references/`。参数的完整说明和实测数据见 `references/params.md`。
 
 ## 必须遵守
@@ -27,15 +27,15 @@ description: 用 remote-linux MCP 在 GPU/DCU 节点的容器里安装并运行 
 ### 1. 先确认现状（只读）
 
 - 镜像：`docker images aider_run`。
-- aider 仓库（`<AIDER_DIR>`，本环境 `/data0/songjiajun/aider/aider`）和数据集（`<AIDER_DIR>/tmp.benchmarks/polyglot-benchmark`，含六个语言目录）。
+- aider 仓库（`<AIDER_DIR>`，本环境 `/data/<user>/aider/aider`）和数据集（`<AIDER_DIR>/tmp.benchmarks/polyglot-benchmark`，含六个语言目录）。
 - 服务可达：`curl http://<服务>:30000/v1/models`。
 - **数据集的两个坑**（本环境实测）：
-  - zip 解压出来的那份 `/data0/songjiajun/polyglot-benchmark`，47 个 Java 习题的 `gradlew` 全是 CRLF 换行且没有可执行位（shebang 变成 `#!/bin/sh\r`，运行报“找不到命令”，返回 127）。正在使用的 `tmp.benchmarks/polyglot-benchmark` 没有这个问题。检查：`head -1 gradlew | od -c`（应是 `#!/bin/sh` 加 `\n`）和 `ls -l gradlew`（应有 x）。修复思路是 `sed -i 's/\r$//' gradlew && chmod +x gradlew`，**这个修复我没有实测过**，用之前先在一个习题上试。
+  - zip 解压出来的那份 `/data/<user>/polyglot-benchmark`，47 个 Java 习题的 `gradlew` 全是 CRLF 换行且没有可执行位（shebang 变成 `#!/bin/sh\r`，运行报“找不到命令”，返回 127）。正在使用的 `tmp.benchmarks/polyglot-benchmark` 没有这个问题。检查：`head -1 gradlew | od -c`（应是 `#!/bin/sh` 加 `\n`）和 `ls -l gradlew`（应有 x）。修复思路是 `sed -i 's/\r$//' gradlew && chmod +x gradlew`，**这个修复我没有实测过**，用之前先在一个习题上试。
   - JS 习题的依赖：本环境每个习题目录自带 `node_modules`（49/49），镜像里**没有** `/npm-install`；`npm-test.sh` 只在习题目录没有 `node_modules` 时才去链接 `/npm-install`。数据集副本如果没有 `node_modules`，在容器里 `cd <数据集>/javascript/exercises/practice && for d in */; do (cd "$d" && npm install); done`（shell 历史里的做法，npm 源用 npmmirror，本次没有重跑）。
 
 ### 2. 准备镜像
 
-**快路径**：已有镜像 tar 时 `docker load -i <tar>`。本环境的 tar 在 tencent06 的 `/data0/songjiajun/airun_songj_261023.tar`（约 1.5 GB，含 `aider_run:20261023` 和 `aider_run:latest`，sha256 `c1087efbb8622f6f2d38fefb8a3f5b0d82987635d910b3aa3e7448e50e9f764e`，blob 校验通过）。**`docker load` 这一步没有在新节点上实测过。**
+**快路径**：已有镜像 tar 时 `docker load -i <tar>`。本环境的 tar 在 node-B 的 `/data/<user>/airun_songj_261023.tar`（约 1.5 GB，含 `aider_run:20261023` 和 `aider_run:latest`，sha256 `c1087efbb8622f6f2d38fefb8a3f5b0d82987635d910b3aa3e7448e50e9f764e`，blob 校验通过）。**`docker load` 这一步没有在新节点上实测过。**
 
 **从头构建**（基础镜像 `docker.1ms.run/library/buildpack-deps:jammy`）：
 
@@ -52,7 +52,15 @@ description: 用 remote-linux MCP 在 GPU/DCU 节点的容器里安装并运行 
 
 ### 3. 起容器
 
-`bash <SKILL>/scripts/run_container.sh`（环境变量见脚本头部：`AIDER_IMAGE`、`CONTAINER_NAME`、`AIDER_DIR`、`BENCH_DIR`、`OPENAI_API_BASE`、`MEMORY`）。`docker commit` 不保存挂载和内存限制，所以必须每次带上；aider 本体是 editable 安装、数据集也不在镜像里，不挂载 `import aider` 会失败。脚本在容器已存在、目录不存在时拒绝执行。
+`AIDER_DIR` 和 `OPENAI_API_BASE` 必须由用户提供，不再使用历史节点或个人路径作为默认值。先确认这两个值，再运行：
+
+```bash
+AIDER_DIR="/data/<用户名>/aider/aider" \
+OPENAI_API_BASE="http://<服务IP>:30000/v1" \
+bash <SKILL>/scripts/run_container.sh
+```
+
+其余环境变量见脚本头部：`AIDER_IMAGE`、`CONTAINER_NAME`、`BENCH_DIR`、`OPENAI_API_KEY`、`MEMORY`。`docker commit` 不保存挂载和内存限制，所以必须每次带上；aider 本体是 editable 安装、数据集也不在镜像里，不挂载 `import aider` 会失败。脚本在容器已存在、目录不存在时拒绝执行。
 
 ### 4. 跑 benchmark
 
@@ -111,16 +119,16 @@ python3 <SKILL>/scripts/single_req.py <SKILL>/repro/A_spiral-matrix_lint-fix.jso
 
 | 服务 | 方式 | 结果 |
 |---|---|---|
-| tencent06，带 MTP（DSPARK） | 10 并发、600 秒超时，effort 取 low/high/max 各 10 次 | 600 秒内结束的：low 1/10、high 6/10、max 5/10，其余全部在循环 |
-| tencent05，不带 MTP | 3 个并发、1200 秒超时 | 2 个循环到超时，1 个 140 秒结束 |
-| tencent05，不带 MTP | 3 个并发、1800 秒超时 | 2 个循环到超时（各约 2.46 万个 chunk，答案为空），1 个 109 秒结束 |
+| node-B，带 MTP（DSPARK） | 10 并发、600 秒超时，effort 取 low/high/max 各 10 次 | 600 秒内结束的：low 1/10、high 6/10、max 5/10，其余全部在循环 |
+| node-A，不带 MTP | 3 个并发、1200 秒超时 | 2 个循环到超时，1 个 140 秒结束 |
+| node-A，不带 MTP | 3 个并发、1800 秒超时 | 2 个循环到超时（各约 2.46 万个 chunk，答案为空），1 个 109 秒结束 |
 
-没带 MTP 的服务上同样会出现循环，说明循环**不依赖** MTP。两边的并发、超时、`--context-length` 等条件都不一样，没有控制变量，所以不能用这几组数字比较两边的发生率。05 上单个请求的生成速度约 13.5 token/s，所以 600 秒只够生成约 8000 token，思考加答案超过这个长度的请求，不管是不是循环都会超时。
+没带 MTP 的服务上同样会出现循环，说明循环**不依赖** MTP。两边的并发、超时、`--context-length` 等条件都不一样，没有控制变量，所以不能用这几组数字比较两边的发生率。node-A 上单个请求的生成速度约 13.5 token/s，所以 600 秒只够生成约 8000 token，思考加答案超过这个长度的请求，不管是不是循环都会超时。
 
 ## 已知问题与局限
 
 - 镜像 `docker load` 路径、数据集 gradlew 的修复命令、`pip install -e .[dev]` 一次装齐、Node tarball 的完整下载，都没有在本环境实测，文中已标注。
 - `LITELLM_LOCAL_MODEL_COST_MAP=True` 只验证了能让 `import litellm` 从 7.1 秒降到 1.7 秒，没有在完整 benchmark 里跑过（`references/params.md` 里有细节）。
-- 结果受服务端配置、并发、上下文长度影响，不同次运行之间的服务端配置不一定一致（06 的 `--context-length` 在 10-23 当天从 307200 变成过 262144），做对照前先确认服务端参数。
+- 结果受服务端配置、并发、上下文长度影响，不同次运行之间的服务端配置不一定一致（node-B 的 `--context-length` 在 10-23 当天从 307200 变成过 262144），做对照前先确认服务端参数。
 - 只测过 DeepSeek-V4-Flash 这一个模型，思考模式靠请求里的 `chat_template_kwargs.thinking`，其他模型要另行确认。
-- 脚本里的默认路径、IP、模型名都是本环境的值，换环境要通过环境变量或参数覆盖。
+- 服务地址与 aider 仓库路径为必填配置；示例路径和历史节点别名均已脱敏，不能直接用作部署值。模型名与历史实测配置仍用于解释结果，换模型后需调整配置文件。
