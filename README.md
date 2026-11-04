@@ -1,12 +1,13 @@
 # dcu_skill
 
-Hygon DCU 节点的三个 agent skill（Claude Code / Codex 通用）的集合目录；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
+Hygon DCU 节点的四个 agent skill（Claude Code / Codex 通用）的集合目录；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
 
 `sglang-pd-deploy` 以内部 `das/SkillHub` 的 `skills/sglang-pd-deploy/` 为主版本，本目录同步其运行文件。PD 的通用修改先在 SkillHub 维护，再同步到这里；`skill-card.md` 等目录注册元数据由 SkillHub 管理。另两个 skill 继续在本仓库维护。
 
 | 目录 | skill 名 | 作用 |
 |---|---|---|
 | [`deploy/node-setup/`](deploy/node-setup) | `node-setup` | 全新 GPU/DCU 节点初始化：勘察、挂盘、装 docker、装海光 DCU 驱动 |
+| [deploy/claude-mem-observer-ops/](deploy/claude-mem-observer-ops) | claude-mem-observer-ops | 检查 claude-mem observer、延迟批处理和经授权的历史队列恢复 |
 | [`inference/sglang-pd-deploy/`](inference/sglang-pd-deploy) | `sglang-pd-deploy` | 在节点上部署 sglang PD 分离推理服务（xPyD + mooncake + sglang_router） |
 | [`eval/aider-benchmark/`](eval/aider-benchmark) | `aider-benchmark` | 在容器里安装并运行 aider polyglot benchmark，对接 OpenAI 兼容的 sglang 服务；含参数配置、结果汇总、重复循环的单请求复现 |
 
@@ -22,7 +23,7 @@ Hygon DCU 节点的三个 agent skill（Claude Code / Codex 通用）的集合�
 在仓库根目录执行以下命令，复制实际 skill 目录的内容；目标目录名要和 `SKILL.md` 中的 `name` 一致。示例同时安装到 CC 的 `~/.claude/skills` 和 Codex 的 `~/.agents/skills`：
 
 ```bash
-for skill_path in deploy/node-setup inference/sglang-pd-deploy eval/aider-benchmark; do
+for skill_path in deploy/node-setup deploy/claude-mem-observer-ops inference/sglang-pd-deploy eval/aider-benchmark; do
   skill_name="${skill_path##*/}"
   for skill_root in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
     mkdir -p "$skill_root/$skill_name"
@@ -34,6 +35,16 @@ done
 升级前备份已有同名包。旧版 PD 包根目录的 `render.py`、`deploy.example.toml`、`deepep-config.json` 已迁到 `scripts/` 和 `assets/`；新文件复制完整后再移除这三个旧文件。若以前装在 `~/.codex/skills`，选定一个 Codex 安装位置并迁移或更新，避免同名包保留不同版本。
 
 之后直接用自然语言触发，例如“初始化这台新节点”“按 deploy.toml 部署 sglang 1P1D”。
+
+## deploy/claude-mem-observer-ops
+
+用于检查本地 worker、SQLite outbox 和批处理审计记录。历史 parked 消息只有在用户明确要求时才恢复；脚本会先校验数量、载荷和数据库备份，再将消息置为 released，由 patched worker 按正常归属和事务流程处理。
+
+| 文件 | 说明 |
+|---|---|
+| SKILL.md | 运维边界、状态模型和恢复流程 |
+| references/recovery.md | outbox 状态、Windows worker 命令和恢复不变量 |
+| scripts/replay_parked_outbox.py | 带数量保护和 SQLite 备份的受控恢复脚本 |
 
 ## deploy/node-setup（node-setup）：节点初始化
 
