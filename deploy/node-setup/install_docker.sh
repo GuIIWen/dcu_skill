@@ -2,11 +2,10 @@
 # 自动安装 docker CE，重试 5 次，接受网络波动。配置 data-root 和内网 registry。
 # 幂等：已装且版本 ≥24 则跳过安装，只更新 daemon.json、重启并验证 data-root 和 insecure-registries。
 # 用法：DATA_ROOT=<用户确认的路径> [REGISTRY=host:port ...空格分隔] bash install_docker.sh
-# 默认使用公司的内网仓库；REGISTRY 可覆盖，显式设为空字符串时不新增（已有配置仍保留）。
+# REGISTRY 由用户提供；省略或设为空字符串时不新增仓库（已有配置仍保留）。
 set -e
 DR=${DATA_ROOT:?set DATA_ROOT, e.g. /data0/docker (confirmed with user)}
-DEFAULT_REGISTRY="42.228.13.241:5000"
-REG=${REGISTRY-$DEFAULT_REGISTRY}
+REG=${REGISTRY-}
 
 # 幂等判定：docker 已存在且版本 ≥24
 if command -v docker >/dev/null 2>&1; then

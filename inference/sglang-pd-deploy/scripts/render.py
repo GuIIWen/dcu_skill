@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """deploy.toml -> 校验 + 生成启动脚本 / 预检与诊断脚本 / plan.md / params.md / plan.json。
 
-用法: python render.py <deploy.toml> [-o <out_dir>] [--params <params.json>]
+用法: python scripts/render.py <deploy.toml> [-o <out_dir>] [--params <params.json>]
 
-规格见仓库 DESIGN.md 第 3、4、6 节（v2：场景简写 / 跨节点实例 / 端口自动分配；v3：最小预检 / 诊断脚本 / 容器内检查 / params.md / params.json + --params）。Python >= 3.11，只用标准库。
+部署流程见 SKILL.md，功能开关见 references/features.md。Python >= 3.11，只用标准库。
 校验失败: 所有错误一次性打印到 stderr，退出码 2，不生成任何文件。
 """
 from __future__ import annotations
@@ -19,21 +19,24 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
-SKILL_DIR = Path(__file__).resolve().parent
-BASELINE_TOML = SKILL_DIR / "deploy.example.toml"
-DEEPEP_DEFAULT = SKILL_DIR / "deepep-config.json"
+SKILL_DIR = Path(__file__).resolve().parents[1]
+BASELINE_TOML = SKILL_DIR / "assets" / "deploy.example.toml"
+DEEPEP_DEFAULT = SKILL_DIR / "assets" / "deepep-config.json"
 
 ROLES = ("prefill", "decode")
 PULL_POLICIES = ("if_not_present", "always", "never")
 ON_CONFLICTS = ("reuse", "abort", "recreate")
 KNOWN_SECTIONS = {"deploy", "nodes", "network", "image", "container", "model", "run",
-                  "mooncake", "router", "prefill", "decode", "env", "args", "topology", "ports"}
+                  "mooncake", "router", "prefill", "decode", "env", "args", "features",
+                  "topology", "ports"}
 TOPOLOGY_KEYS = {"prefill", "decode", "prefill_cards", "decode_cards", "cards_per_node", "nodes"}
 CARDS_TOKEN = "@cards"
-PARAMS_TOP_KEYS = ("_readme", "env", "args", "instances", "mooncake", "router", "derived")
-PARAMS_IGNORED = ("_readme", "derived")
-PARAMS_README = ("可修改 env / args / instances；值 true=开关，false=删除该参数，\"@cards\"=实例总卡数。"
-                 "derived 段只读，改了无效。")
+PARAMS_TOP_KEYS = ("_readme", "features", "env", "args", "instances", "mooncake", "router",
+                   "derived", "resolved", "feature_policy")
+PARAMS_IGNORED = ("_readme", "derived", "resolved", "feature_policy")
+PARAMS_README = ("可修改 features / env / args / instances；features.hicache 和 features.mtp 默认 true；"
+                 "值 true=开关，false=删除该参数，\"@cards\"=实例总卡数。"
+                 "derived / resolved / feature_policy 段只读，改了无效。")
 VALIDATED_CARDS = 4   # 文档验证场景：每实例单节点 4 卡
 DIST_INIT_STRIDE = 100  # sglang DP 会使用 dist-init 后续内部端口，自动端口留出间隔
 DIST_INIT_RESERVED = 8  # 校验显式端口时也为每个 dist-init 预留这个端口区间
@@ -63,6 +66,38 @@ TOOLS_CHECK = 'command -v sglang curl; python -c "import sglang_router" && echo 
 MOONCAKE_TOOLS_CHECK = ("command -v mooncake_master && mooncake_master --help 2>&1 | "
                         "grep -q rpc_port && echo rpc_port_ok")
 
+# Feature switches are explicit so a natural-language request such as
+# "disable MTP and HiCache" has one deterministic rendering path.  PD
+# transport remains enabled when HiCache is disabled; only the hierarchical
+# cache flags are removed.
+FEATURE_NAMES = ("hicache", "mtp")
+FEATURE_ARG_KEYS = {
+    "hicache": (
+        "enable-hierarchical-cache", "hicache-ratio", "enable-two-batch-overlap",
+        "hicache-mem-layout", "hicache-io-backend", "hicache-write-policy",
+        "hicache-storage-backend", "hicache-storage-prefetch-policy",
+    ),
+    "mtp": (
+        "speculative-algorithm", "speculative-num-steps", "speculative-eagle-topk",
+        "speculative-num-draft-tokens", "speculative-moe-a2a-backend",
+        "speculative-moe-runner-backend",
+    ),
+}
+FEATURE_ENV_KEYS = {
+    "hicache": (
+        "MOONCAKE_LOCAL_HOSTNAME", "MOONCAKE_TE_META_DATA_SERVER",
+        "MOONCAKE_MASTER", "MOONCAKE_GLOBAL_SEGMENT_SIZE",
+    ),
+    "mtp": (
+        "SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS",
+        "SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD",
+        "SGLANG_DSPARK_ENABLE_MULTI_STREAM",
+        "SGLANG_DSPARK_FAST_KERNEL",
+        "SGLANG_DSPARK_FAST_SAMPLING",
+        "SGLANG_RAGGED_VERIFY_MODE",
+    ),
+}
+
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ARG_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -77,7 +112,7 @@ q = shlex.quote
 @dataclass
 class Node:
     alias: str
-    mcp_host: str
+    target: str
     ip: str
     ifname: str
     ib_devices: list
@@ -166,6 +201,7 @@ class Config:
     mode: str = ""             # "topology" | "explicit"
     scenario_warning: str = ""
     params_src: str = ""       # --params 文件的绝对路径；空 = 未使用
+    features: dict = field(default_factory=lambda: {"hicache": True, "mtp": True})
     role_env: dict = field(default_factory=dict)    # 有效值（false 已删除、键已规范化）
     role_args: dict = field(default_factory=dict)
 
@@ -337,6 +373,57 @@ def _effective(d: dict) -> dict:
     return {k: v for k, v in d.items() if v is not False}
 
 
+def _feature_values(raw_features, params, errors) -> dict:
+    """Resolve feature switches from TOML defaults plus optional params JSON."""
+    values = {name: True for name in FEATURE_NAMES}
+
+    def apply(table, where):
+        if table is None:
+            return
+        if not isinstance(table, dict):
+            errors.append(f"{where} 必须是对象")
+            return
+        for key, value in table.items():
+            if key not in FEATURE_NAMES:
+                errors.append(f"{where}: 未知功能 {key!r}（可用 {' / '.join(FEATURE_NAMES)}）")
+            elif not isinstance(value, bool):
+                errors.append(f"{where}.{key} 必须是布尔值")
+            else:
+                values[key] = value
+
+    apply(raw_features, "[features]")
+    if "features" in params:
+        apply(params["features"], "params features")
+    return values
+
+
+def _strip_disabled_features(env: dict, args: dict, features: dict):
+    """Remove feature-owned values after role/instance overlays are merged."""
+    removed = {"env": {}, "args": {}}
+    for feature in FEATURE_NAMES:
+        if features.get(feature, True):
+            continue
+        for key in FEATURE_ENV_KEYS[feature]:
+            if key in env:
+                removed["env"][key] = env.pop(key)
+        for key in FEATURE_ARG_KEYS[feature]:
+            if key in args:
+                removed["args"][key] = args.pop(key)
+    return removed
+
+
+def feature_policy(features: dict) -> dict:
+    """Return a reviewable feature/removal contract for params.json and params.md."""
+    return {
+        feature: {
+            "enabled": bool(features.get(feature, True)),
+            "removed_env_when_disabled": list(FEATURE_ENV_KEYS[feature]),
+            "removed_args_when_disabled": list(FEATURE_ARG_KEYS[feature]),
+        }
+        for feature in FEATURE_NAMES
+    }
+
+
 def load_params(path, errors: list) -> dict:
     """读 --params JSON，返回生效的顶层键（去掉 _readme / derived）；出错记入 errors 并返回 {}。"""
     try:
@@ -406,6 +493,8 @@ def load(toml_path: Path, params_path=None):
     for k in raw:
         if k not in KNOWN_SECTIONS:
             warnings.append(f"未知段 [{k}]，已忽略")
+
+    cfg.features = _feature_values(raw.get("features"), params, errors)
 
     # deploy / image / container / model / run
     deploy = _table(raw, "deploy", "[deploy]", errors)
@@ -497,7 +586,7 @@ def load(toml_path: Path, params_path=None):
         if not isinstance(nd, dict):
             errors.append(f"{path} 必须是表")
             continue
-        mcp_host = _req_str(nd.get("mcp_host"), f"{path}.mcp_host", errors)
+        target = _req_str(nd.get("target"), f"{path}.target", errors)
         ip = _req_str(nd.get("ip"), f"{path}.ip", errors)
         nn = nd.get("network", {})
         if not isinstance(nn, dict):
@@ -516,7 +605,7 @@ def load(toml_path: Path, params_path=None):
         if not is_int(ibp) or ibp < 0:
             errors.append(f"{path}: ib_port 必须是非负整数")
             ibp = 1
-        cfg.nodes[alias] = Node(alias, mcp_host, ip, ifname, ibs, ibp)
+        cfg.nodes[alias] = Node(alias, target, ip, ifname, ibs, ibp)
 
     # env / args 角色默认值
     env_raw = _table(raw, "env", "[env]", errors)
@@ -545,6 +634,7 @@ def load(toml_path: Path, params_path=None):
             role_args_raw[role] = _norm_kv(p_kv["args"][role], f"params args.{role}", "args", errors)
         else:
             role_args_raw[role] = _norm_kv(args_raw.get(role, {}), f"[args.{role}]", "args", errors)
+        _strip_disabled_features(role_env_raw[role], role_args_raw[role], cfg.features)
         cfg.role_env[role] = _effective(role_env_raw[role])
         cfg.role_args[role] = _effective(role_args_raw[role])
 
@@ -563,6 +653,8 @@ def load(toml_path: Path, params_path=None):
 
     specs = _expand_specs(raw, cfg, errors)
     _apply_instance_params(params, specs, cfg, errors)
+    for sp in specs:
+        _strip_disabled_features(sp.env, sp.args, cfg.features)
     for gi, sp in enumerate(specs):
         where = f"{sp.role}_{sp.idx}"
         auto = {"port": cfg.http_base, "bootstrap_port": cfg.bootstrap_base,
@@ -598,10 +690,11 @@ def load(toml_path: Path, params_path=None):
     for a in cfg.unused_nodes:
         warnings.append(f"节点 {a} 没有任何实例，不生成预检/上传")
     for i in cfg.prefills:
-        if not i.args.get("enable-hierarchical-cache"):
-            warnings.append(f"{i.name} 未启用 enable-hierarchical-cache，mooncake 分配将为 0（文档 FAQ 1）")
-        if i.args.get("hicache-storage-backend") != "mooncake":
-            warnings.append(f"{i.name} 的 hicache-storage-backend 不是 mooncake")
+        if cfg.features["hicache"]:
+            if not i.args.get("enable-hierarchical-cache"):
+                warnings.append(f"{i.name} 未启用 enable-hierarchical-cache，无法分配 HICache Store segment")
+            if i.args.get("hicache-storage-backend") != "mooncake":
+                warnings.append(f"{i.name} 的 hicache-storage-backend 不是 mooncake")
     if cfg.instances and not errors and not cfg.validated_scenario:
         cfg.scenario_warning = (f"当前场景（{describe_scenario(cfg)}）与文档验证场景（单节点 {VALIDATED_CARDS} 卡/实例）"
                                 f"不同：env/args 中的调优参数未在该场景验证过，起不来时按 SKILL.md 排障表查 cookbook。")
@@ -800,8 +893,9 @@ def _check_topology(cfg: Config, errors: list):
                     ports.setdefault(r0.node, {}).setdefault(p, []).append(f"{i.name}.{label}")
     if cfg.prefills and cfg.p1.rank0.node in cfg.nodes:
         d = ports.setdefault(cfg.p1.rank0.node, {})
-        d.setdefault(cfg.rpc_port, []).append("mooncake.rpc_port")
-        d.setdefault(cfg.metadata_port, []).append("mooncake.metadata_port")
+        if cfg.features["hicache"]:
+            d.setdefault(cfg.rpc_port, []).append("mooncake.rpc_port")
+            d.setdefault(cfg.metadata_port, []).append("mooncake.metadata_port")
         d.setdefault(cfg.router_port, []).append("router.port")
     for alias in cfg.nodes:
         for c, owners in sorted(cards.get(alias, {}).items()):
@@ -830,10 +924,10 @@ def _check_dist_init_ranges(cfg: Config, errors: list):
             ports.setdefault(node, []).append((port, f"{i.name}.{label}"))
     if cfg.prefills and cfg.p1.rank0.node in cfg.nodes:
         node = cfg.p1.rank0.node
-        for label, port in (("mooncake.rpc_port", cfg.rpc_port),
-                            ("mooncake.metadata_port", cfg.metadata_port),
-                            ("router.port", cfg.router_port)):
-            ports.setdefault(node, []).append((port, label))
+        ports.setdefault(node, []).append((cfg.router_port, "router.port"))
+        if cfg.features["hicache"]:
+            ports[node] += [(cfg.rpc_port, "mooncake.rpc_port"),
+                            (cfg.metadata_port, "mooncake.metadata_port")]
     for n, (node, lo, hi, name) in enumerate(ranges):
         for other_node, other_lo, other_hi, other_name in ranges[n + 1:]:
             if node == other_node and max(lo, other_lo) <= min(hi, other_hi):
@@ -892,7 +986,7 @@ def derived_env(cfg: Config, inst: Instance, m: Member) -> list:
         ("MC_ALLOWED_IBV_DEVICES", ",".join(node.ib_devices)),
         ("SGLANG_TORCH_PROFILER_DIR", f"{cfg.deploy_dir}/profile"),
     ]
-    if inst.role == "prefill":
+    if inst.role == "prefill" and cfg.features["hicache"]:
         p1ip = cfg.p1_node.ip
         out += [
             ("MOONCAKE_LOCAL_HOSTNAME", node.ip),
@@ -1183,7 +1277,7 @@ list_roce_v2() {
 
 
 def preflight_script(cfg: Config, node: Node) -> str:
-    """宿主机只读预检（DESIGN §6.1）：docker / 镜像 / 容器 / 端口 / 模型 / work_dir。"""
+    """宿主机只读预检：docker / 镜像 / 容器 / 端口 / 模型 / work_dir。"""
     mems = cfg.members_on(node.alias)           # [(实例, member)]
     p1_here = cfg.p1.rank0.node == node.alias
     L = [
@@ -1276,11 +1370,10 @@ def preflight_script(cfg: Config, node: Node) -> str:
                          ("dist_init_port", i.dist_init_port)):
             L.append(f"check_port {p} {q(i.name + '.' + label)}")
     if p1_here:
-        L += [
-            f"check_port {cfg.rpc_port} mooncake.rpc_port",
-            f"check_port {cfg.metadata_port} mooncake.metadata_port",
-            f"check_port {cfg.router_port} router.port",
-        ]
+        if cfg.features["hicache"]:
+            L += [f"check_port {cfg.rpc_port} mooncake.rpc_port",
+                  f"check_port {cfg.metadata_port} mooncake.metadata_port"]
+        L.append(f"check_port {cfg.router_port} router.port")
     model_dir = f"{cfg.model_root}/{cfg.model_dir}"
     L += [
         "# 5. model",
@@ -1319,7 +1412,7 @@ def preflight_script(cfg: Config, node: Node) -> str:
 
 
 def diag_script(cfg: Config, node: Node) -> str:
-    """宿主机只读诊断（DESIGN §6.2）：卡 / 网卡 / IB / GID / 模型文件数 / curl / free，按需执行。"""
+    """宿主机只读诊断：卡 / 网卡 / IB / GID / 模型文件数 / curl / free，按需执行。"""
     mems = cfg.members_on(node.alias)
     L = [
         "#!/usr/bin/env bash",
@@ -1391,10 +1484,11 @@ def diag_script(cfg: Config, node: Node) -> str:
 
 # ───────────────────────── 卡空闲检查 ─────────────────────────
 
-CARDS_LIB = r"""# Parsing assumptions (hy-smi / rocm-smi output formats were NOT verified on real hardware):
+CARDS_LIB = r"""# Parsing assumptions (unrecognized output remains UNKNOWN):
 #  * memory, per tool, tried in this order until every planned card has a value:
 #      1. `<tool> --showmeminfo vram --json`: JSON with one object per card, keyed "card<N>" (GPU<N> / DCU[<N>]
-#         also accepted), holding "VRAM Total Memory (B)" and "VRAM Total Used Memory (B)" in bytes.
+#         also accepted), holding "VRAM Total Memory (<unit>)" and "VRAM Total Used Memory (<unit>)".
+#         Keep the reported units in the detail; normalize B/KiB/MiB/GiB/TiB and KB/MB/GB/TB for percentages.
 #      2. `<tool>` default table: a header line with a VRAM% column; data rows start with the card index and
 #         have exactly as many fields as the header.
 #      3. `<tool> --showmemuse`: lines like "GPU[<N>] : GPU memory use (%): <num>".
@@ -1412,20 +1506,34 @@ to() {
   if have timeout; then timeout "$t" "$@"; else "$@"; fi
 }
 AWK_JSON='
-function num(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/[^0-9].*$/, "", s); return s }
+BEGIN {
+  scale["B"] = 1
+  scale["KiB"] = 1024; scale["MiB"] = 1024^2; scale["GiB"] = 1024^3; scale["TiB"] = 1024^4
+  scale["KB"] = 1000; scale["MB"] = 1000^2; scale["GB"] = 1000^3; scale["TB"] = 1000^4
+  units["b"] = units["bytes"] = "B"
+  units["kib"] = "KiB"; units["mib"] = "MiB"; units["gib"] = "GiB"; units["tib"] = "TiB"
+  units["kb"] = "KB"; units["mb"] = "MB"; units["gb"] = "GB"; units["tb"] = "TB"
+}
+function num(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/[^0-9.].*$/, "", s); return s }
+function unit(s, u) {
+  if (!match(s, /\([ \t]*(bytes|b|kib|mib|gib|tib|kb|mb|gb|tb)[ \t]*\)/)) return ""
+  u = substr(s, RSTART, RLENGTH); gsub(/[() \t]/, "", u)
+  return units[u]
+}
 {
   n = split($0, P, /[{},]/)
   for (k = 1; k <= n; k++) {
     s = P[k]; l = tolower(s)
     if (match(s, /"[A-Za-z]+\[?[0-9]+\]?"/)) { cur = substr(s, RSTART, RLENGTH); gsub(/[^0-9]/, "", cur) }
-    else if (cur != "" && l ~ /vram total used memory/) used[cur] = num(s)
-    else if (cur != "" && l ~ /vram total memory/) tot[cur] = num(s)
+    else if (cur != "" && l ~ /vram total used memory/) { used[cur] = num(s); used_unit[cur] = unit(l) }
+    else if (cur != "" && l ~ /vram total memory/) { tot[cur] = num(s); total_unit[cur] = unit(l) }
   }
 }
 END {
   for (c in tot)
-    if (tot[c] ~ /^[0-9]+$/ && tot[c] + 0 > 0 && used[c] ~ /^[0-9]+$/)
-      printf "M %s %.2f %sB/%sB\n", c, used[c] * 100 / tot[c], used[c], tot[c]
+    if (tot[c] ~ /^[0-9]+(\.[0-9]+)?$/ && tot[c] + 0 > 0 && used[c] ~ /^[0-9]+(\.[0-9]+)?$/ &&
+        total_unit[c] in scale && used_unit[c] in scale)
+      printf "M %s %.2f %s%s/%s%s\n", c, used[c] * scale[used_unit[c]] * 100 / (tot[c] * scale[total_unit[c]]), used[c], used_unit[c], tot[c], total_unit[c]
 }'
 AWK_TABLE='
 !hdr && index($0, "VRAM%") {
@@ -1589,7 +1697,7 @@ main() {
 
 
 def cards_script(cfg: Config, node: Node) -> str:
-    """宿主机只读卡空闲检查（DESIGN §6.7）：只查本节点计划使用的卡（含跨节点 member）。"""
+    """宿主机只读卡空闲检查：只查本节点计划使用的卡。"""
     cards = sorted({c for i, m in cfg.members_on(node.alias) for c in m.cards})
     return "\n".join([
         "#!/usr/bin/env bash",
@@ -1698,7 +1806,9 @@ LISTEN_CHECK = (
 def upload_script_names(cfg: Config, node: Node) -> list:
     names = [m.name for i, m in cfg.members_on(node.alias)]
     if cfg.p1.rank0.node == node.alias:
-        names += ["mooncake_master", "router"]
+        if cfg.features["hicache"]:
+            names.append("mooncake_master")
+        names.append("router")
     names.append("stop")
     return names
 
@@ -1730,15 +1840,21 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
     p1 = cfg.p1
     p1node = cfg.p1_node
     pull_log = f"/tmp/{cfg.prefix}_pull.log"
+    # Keep backgrounding inside its own shell when an adapter prefixes `cd ... &&`.
+    pull_inner = (f"setsid nohup docker pull {q(cfg.image_ref)} "
+                  f"> {q(pull_log)} 2>&1 < /dev/null &")
+    image_tools = TOOLS_CHECK
+    if cfg.features["hicache"]:
+        image_tools += "; " + MOONCAKE_TOOLS_CHECK
     plan = {
         "prefix": cfg.prefix, "deploy_dir": dd, "served_model_name": cfg.served,
         "image": {
             "ref": cfg.image_ref, "pull_policy": cfg.pull_policy,
             "check_cmd": f"docker image inspect {q(cfg.image_ref)} -f '{{{{.Id}}}}'",
-            "pull_cmd": f"nohup docker pull {q(cfg.image_ref)} > {q(pull_log)} 2>&1 &",
+            "pull_cmd": f"bash -c {q(pull_inner)}",
             "pull_log": pull_log,
             "tools_check_cmd": (f"docker run --rm --network=host --entrypoint bash {q(cfg.image_ref)} "
-                                f"-lc {q(TOOLS_CHECK + '; ' + MOONCAKE_TOOLS_CHECK)}"),
+                                f"-lc {q(image_tools)}"),
         },
         "nodes": [], "containers": [], "instances": [],
     }
@@ -1747,7 +1863,7 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
     for node in cfg.used_nodes:
         b64 = base64.b64encode(preflights[node.alias].encode("utf-8")).decode("ascii")
         plan["nodes"].append({
-            "alias": node.alias, "mcp_host": node.mcp_host, "ip": node.ip,
+            "alias": node.alias, "target": node.target, "ip": node.ip,
             "cards_check_cmd": f"echo {cards_b64[node.alias]} | base64 -d | bash",
             "preflight_cmd": f"echo {b64} | base64 -d | bash",
             "diag_cmd": f"echo {diag_b64[node.alias]} | base64 -d | bash",
@@ -1764,13 +1880,13 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
             node = cfg.node_of(m)
             tools = TOOLS_CHECK
             tools += f"; test -f {q(cfg.model_path + 'config.json')} && echo model_path_ok"
-            if m is p1.rank0:
+            if m is p1.rank0 and cfg.features["hicache"]:
                 tools += "; " + MOONCAKE_TOOLS_CHECK
             w = f"{dd}/logs/.w_{c}"
             write_inner = (f"test -d {q(dd + '/scripts')} && test -d {q(dd + '/logs')} && "
                            f"test -d {q(dd + '/run')} && touch {q(w)} && rm {q(w)} && echo writable")
             plan["containers"].append({
-                "name": c, "node": node.alias, "mcp_host": node.mcp_host,
+                "name": c, "node": node.alias, "target": node.target,
                 "run_cmd": " ".join(docker_run_tokens(cfg, c)),
                 "start_cmd": f"docker start {q(c)}",
                 "rm_cmd": f"docker rm -f {q(c)}",
@@ -1781,16 +1897,17 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
             if m.rank != 0:  # node_rank >= 1 skips warmup and never logs the ready marker; rank0 ready covers it
                 cmds["ready_cmd"] = None
             members.append({
-                "rank": m.rank, "node": node.alias, "mcp_host": node.mcp_host, "ip": node.ip,
+                "rank": m.rank, "node": node.alias, "target": node.target, "ip": node.ip,
                 "cards": m.cards, **cmds,
                 "mooncake_ok_cmd": (dexec(c, f"grep -c 'Mooncake store setup successfully' {q(cmds['log'])}")
-                                    if i.role == "prefill" else None),
-                "mooncake_expected": len(m.cards) if i.role == "prefill" else None,
+                                    if i.role == "prefill" and cfg.features["hicache"] else None),
+                "mooncake_expected": (len(m.cards)
+                                      if i.role == "prefill" and cfg.features["hicache"] else None),
             })
         r0 = cfg.node_of(i.rank0)
         plan["instances"].append({
             "name": i.name, "role": i.role, "index": i.index,
-            "mcp_host": r0.mcp_host, "ip": r0.ip,     # rank0（health 在此检查）
+            "target": r0.target, "ip": r0.ip,     # rank0（health 在此检查）
             "port": i.port, "bootstrap_port": i.bootstrap_port, "dist_init_port": i.dist_init_port,
             "health_cmd": health_cmd(i.name, r0.ip, i.port),
             "listen_check_cmd": dexec(i.name, LISTEN_CHECK.format(ports=str(i.port))),
@@ -1801,17 +1918,24 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
     mc = component_cmds(cfg, p1.name, "mooncake_master")
     listen_inner = LISTEN_CHECK.format(ports=f"{cfg.rpc_port} {cfg.metadata_port}")
     plan["mooncake"] = {
-        "container": mc["container"], "mcp_host": p1node.mcp_host,
-        "launch_cmd": mc["launch_cmd"], "stop_cmd": mc["stop_cmd"], "log": mc["log"],
-        "ports": [cfg.rpc_port, cfg.metadata_port],
-        "listen_check_cmd": dexec(p1.name, listen_inner),
-        "mem_cmd": dexec(p1.name, f"grep -o 'Mem Storage: [^|]*' {q(mc['log'])} | tail -n 1"),
-        "expected_total": cfg.expected_total, "ranks": cfg.total_ranks,
+        # This component is the Store master, not the in-worker PD Transfer Engine.
+        "enabled": cfg.features["hicache"],
+        "container": mc["container"], "target": p1node.target,
+        "launch_cmd": mc["launch_cmd"] if cfg.features["hicache"] else None,
+        "stop_cmd": mc["stop_cmd"] if cfg.features["hicache"] else None,
+        "log": mc["log"] if cfg.features["hicache"] else None,
+        "ports": [cfg.rpc_port, cfg.metadata_port] if cfg.features["hicache"] else [],
+        "listen_check_cmd": dexec(p1.name, listen_inner) if cfg.features["hicache"] else None,
+        "mem_cmd": (dexec(p1.name, f"grep -o 'Mem Storage: [^|]*' {q(mc['log'])} | tail -n 1")
+                    if cfg.features["hicache"] else None),
+        "expected_total": cfg.expected_total if cfg.features["hicache"] else None,
+        "ranks": cfg.total_ranks if cfg.features["hicache"] else 0,
+        "hicache_enabled": cfg.features["hicache"],
     }
     rt = component_cmds(cfg, p1.name, "router")
     url = f"http://{p1node.ip}:{cfg.router_port}"
     plan["router"] = {
-        "container": rt["container"], "mcp_host": p1node.mcp_host, "url": url,
+        "container": rt["container"], "target": p1node.target, "url": url,
         "port": cfg.router_port, "launch_cmd": rt["launch_cmd"], "stop_cmd": rt["stop_cmd"],
         "log": rt["log"], "alive_cmd": rt["alive_cmd"],
         "health_cmd": health_cmd(p1.name, p1node.ip, cfg.router_port),
@@ -1849,7 +1973,8 @@ def build_plan(cfg: Config, out: Path, preflights: dict, diags: dict, cards: dic
                      f"n=$((n+1)); done")
     plan["final_curl_validate_batch_cmd"] = dexec(p1.name, checked_batch)
     plan["stop_order"] = (["router"] + [i.name for i in cfg.decodes]
-                          + [i.name for i in cfg.prefills] + ["mooncake"])
+                          + [i.name for i in cfg.prefills]
+                          + (["mooncake"] if cfg.features["hicache"] else []))
     return plan
 
 
@@ -1920,30 +2045,35 @@ def plan_md(cfg: Config, out: Path, warnings: list, bodies: dict, plan: dict) ->
     if cfg.params_src:
         L += [params_source_line(cfg), ""]
     how = "`[topology]` 场景简写自动展开" if cfg.mode == "topology" else "显式 `[[prefill]]`/`[[decode]]`"
+    mooncake_summary = (
+        f"- mooncake master：容器 `{p1.name}`（rank0，{p1node.target} / {p1node.ip}），"
+        f"rpc `{cfg.rpc_port}`，metadata `{cfg.metadata_port}`；"
+        f"每 rank segment `{cfg.segment_size}`，prefill 共 {cfg.total_ranks} rank，"
+        f"期望总量 `{cfg.expected_total}`"
+        if cfg.features["hicache"] else
+        "- Mooncake Store master / HTTP metadata 已关闭，不生成启动脚本、不占用固定端口、不分配 Store segment；"
+        "保留 worker 内的 PD Transfer Engine（P2PHANDSHAKE）。")
     L += ["## 1. 拓扑", "",
           f"场景：{describe_scenario(cfg)}；写法：{how}；端口自动分配基数 "
           f"http={cfg.http_base} / bootstrap={cfg.bootstrap_base} / dist-init={cfg.dist_base}"
           "（显式写死的端口除外）。",
           "",
-          "| 实例 | rank | 节点 | 容器 | mcp_host | ip | 卡 | port | bootstrap | dist-init |",
+          "| 实例 | rank | 节点 | 容器 | target | ip | 卡 | port | bootstrap | dist-init |",
           "|---|---|---|---|---|---|---|---|---|---|"]
     for i in cfg.instances:
         for m in i.members:
             n = cfg.node_of(m)
             ports = (f"{i.port} | {i.bootstrap_port} | {i.dist_init_port}" if m.rank == 0
                      else "- | - | -")
-            L.append(f"| {i.name} | {m.rank} | {m.node} | {i.name} | {n.mcp_host} | {n.ip} "
+            L.append(f"| {i.name} | {m.rank} | {m.node} | {i.name} | {n.target} | {n.ip} "
                      f"| {','.join(map(str, m.cards))} | {ports} |")
     if any(i.multi for i in cfg.instances):
         L += ["", "跨节点实例：所有 rank 同时启动；HTTP / bootstrap / health 只在 rank0，"
                   "`--dist-init-addr` 指向 rank0 节点 ip；`@cards` = 实例总卡数。"]
     L += ["",
-          "- 未使用节点：" + (", ".join(f"{a}（{cfg.nodes[a].mcp_host}）" for a in cfg.unused_nodes)
+          "- 未使用节点：" + (", ".join(f"{a}（{cfg.nodes[a].target}）" for a in cfg.unused_nodes)
                             if cfg.unused_nodes else "无"),
-          f"- mooncake master：容器 `{p1.name}`（rank0，{p1node.mcp_host} / {p1node.ip}），"
-          f"rpc `{cfg.rpc_port}`，metadata `{cfg.metadata_port}`；"
-          f"每 rank segment `{cfg.segment_size}`，prefill 共 {cfg.total_ranks} rank，"
-          f"期望总量 `{cfg.expected_total}`",
+          mooncake_summary,
           f"- router：容器 `{p1.name}`，端口 `{cfg.router_port}`，prefill 策略 `{cfg.prefill_policy}`",
           f"- 对外地址：`http://{p1node.ip}:{cfg.router_port}/v1`",
           f"- 模型名：`{cfg.served}`（模型目录 `{cfg.model_root}/{cfg.model_dir}`）",
@@ -1961,24 +2091,29 @@ def plan_md(cfg: Config, out: Path, warnings: list, bodies: dict, plan: dict) ->
           f"显存占用 > `card_busy_mem_pct` = {cfg.card_busy_mem_pct}% 或卡上有进程判 BUSY）。"
           "全部 FREE 才继续；有 BUSY 停下报告占用者，有 UNKNOWN 请用户确认。", "",
           f"1. 镜像（以预检结果为准）：各节点先 `docker image inspect`；缺失，或 pull_policy=always，"
-          f"才执行 `docker pull`。节点：{', '.join(n.mcp_host for n in cfg.used_nodes)}。",
+          f"才执行 `docker pull`。节点：{', '.join(n.target for n in cfg.used_nodes)}。",
           f"2. 容器（on_conflict = `{cfg.on_conflict}`，已存在且一致则复用/start，不存在才 `docker run`）：", ""]
     for i in cfg.instances:
         for m in i.members:
             n = cfg.node_of(m)
-            L += [f"在 `{n.mcp_host}` 上：", "", "```bash",
+            L += [f"在 `{n.target}` 上：", "", "```bash",
                   " \\\n  ".join(docker_run_tokens(cfg, i.name)), "```", ""]
-    L += ["3. 目录与容器：先以宿主机用户执行每个节点的 `prepare_dirs_cmd`，确认 `scripts/`、`logs/`、`run/`、`profile/` 可写，再按预检结论执行 `docker run` / `docker start`；容器内不负责创建宿主机部署目录。", "",
+    L += ["3. 目录与容器：先在对话中展示 params.json 的最终 JSON 参数并取得用户确认，再以宿主机用户执行每个节点的 `prepare_dirs_cmd`，确认 `scripts/`、`logs/`、`run/`、`profile/` 可写，按预检结论执行 `docker run` / `docker start`；容器内不负责创建宿主机部署目录。", "",
            "4. 上传文件（每个节点各一份）：", "", "| 节点 | 本地 | 远端 |", "|---|---|---|"]
     for nd in plan["nodes"]:
         for u in nd["uploads"]:
-            L.append(f"| {nd['mcp_host']} | `{u['local']}` | `{u['remote']}` |")
+            L.append(f"| {nd['target']} | `{u['local']}` | `{u['remote']}` |")
     L += ["",
-          "5. 启动顺序：上传脚本后先把 params.md（各实例最终 env 与启动命令）交给用户确认；确认后先 mooncake master，再同时启动所有 prefill 和 decode members；轮询 alive_cmd、rank0 ready_cmd、端口监听和实例 /health，全部实例 /health 200 后再启动 router（router 脚本自身也会等所有 worker /health 200 才启动），router health 200 且 workers_check_cmd 输出 registered 后才验收。",
+          "5. 启动顺序：对话中的最终 JSON 参数确认通过后，完成上述建容器和上传操作；"
+          + ("先启动 mooncake master，再" if cfg.features["hicache"] else "直接")
+          + "同时启动所有 prefill 和 decode members；轮询 alive_cmd、rank0 ready_cmd、端口监听和实例 /health，全部实例 /health 200 后再启动 router（router 脚本自身也会等所有 worker /health 200 才启动），router health 200 且 workers_check_cmd 输出 registered 后才验收。",
           "跨节点实例的所有 members 必须同时启动；ready marker 和 health 只查 rank0（rank>0 不打印 ready marker）。",
           "   跨节点实例的每个 member（每个节点的容器/脚本）同时启动；`/health` 只查 rank0。",
-          "6. 验收：各实例 `/health`；prefill 每个 member 日志 `Mooncake store setup successfully` 行数 = 该 member 卡数；"
-          f"mooncake `Mem Storage` = `{cfg.expected_total}`；运行 `final_curl_batch_cmd`（每个 prefill 一次请求），并结合 router 日志确认 round-robin 覆盖每个 prefill。", ""]
+          ("6. 验收：各实例 `/health`；prefill 每个 member 日志 `Mooncake store setup successfully` 行数 = 该 member 卡数；"
+           f"mooncake `Mem Storage` = `{cfg.expected_total}`；"
+           if cfg.features["hicache"] else
+           "6. 验收：各实例 `/health` 和 PD transfer 正常；HICache 已关闭，不检查 Mooncake store 分配；")
+          + "运行 `final_curl_batch_cmd`（每个 prefill 一次请求），并结合 router 日志确认 round-robin 覆盖每个 prefill。", ""]
 
     L += param_sections(cfg, bodies, 3)
     return "\n".join(L)
@@ -1987,22 +2122,57 @@ def plan_md(cfg: Config, out: Path, warnings: list, bodies: dict, plan: dict) ->
 def param_sections(cfg: Config, bodies: dict, first: int) -> list:
     """差异 + 每个 member 的最终 env / 启动命令 + mooncake / router 命令（plan.md 第 3、4 节 = params.md 第 1、2 节）。"""
     p1 = cfg.p1
+    policy = feature_policy(cfg.features)
     L = [f"## {first}. 与文档默认值的差异", "", diff_section(cfg).rstrip("\n"), "",
-         f"## {first + 1}. 最终 env 与启动命令", ""]
+         f"## {first + 1}. 功能开关与自动移除项", "",
+         "| 功能 | 状态 | 关闭时移除的环境变量 | 关闭时移除的启动参数 |",
+         "|---|---|---|---|"]
+    for feature in FEATURE_NAMES:
+        p = policy[feature]
+        state = "enabled" if p["enabled"] else "disabled"
+        L.append(f"| `{feature}` | `{state}` | "
+                 f"{', '.join('`' + x + '`' for x in p['removed_env_when_disabled']) or '无'} | "
+                 f"{', '.join('--' + x for x in p['removed_args_when_disabled']) or '无'} |")
+    L += ["", f"## {first + 2}. 最终 env 与 args（JSON）", "", "```json",
+          json.dumps(resolved_members(cfg), indent=2, ensure_ascii=False, default=str),
+          "```", "", f"## {first + 3}. 最终 env 与启动命令", ""]
     for i in cfg.instances:
         for m in i.members:
             title = (f"{m.name}（{i.name} rank {m.rank}，节点 {m.node}）" if i.multi else i.name)
             L += [f"### {title}", "", "```bash", bodies[m.name].rstrip("\n"), "```", ""]
-    L += ["### mooncake_master（在 " + p1.name + " 容器）", "", "```bash",
-          bodies["mooncake_master"].rstrip("\n"), "```", "",
-          "### router（在 " + p1.name + " 容器）", "", "```bash",
+    if cfg.features["hicache"]:
+        L += ["### mooncake_master（在 " + p1.name + " 容器）", "", "```bash",
+              bodies["mooncake_master"].rstrip("\n"), "```", ""]
+    else:
+        L += ["Mooncake Store master / HTTP metadata 已关闭；PD Transfer Engine 保留，使用 P2PHANDSHAKE。", ""]
+    L += ["### router（在 " + p1.name + " 容器）", "", "```bash",
           bodies["router"].rstrip("\n"), "```", ""]
     return L
 
 
 def params_source_line(cfg: Config) -> str:
-    return (f"> 参数来自 `{cfg.params_src}`（--params：其中的 env / args / instances / mooncake / router "
+    return (f"> 参数来自 `{cfg.params_src}`（--params：其中的 features / env / args / instances / mooncake / router "
             f"覆盖 `{cfg.src_name}` 的对应项）。")
+
+
+def resolved_members(cfg: Config) -> dict:
+    """Return the exact per-member env and args that launcher scripts will use."""
+    resolved = {}
+    for i in cfg.instances:
+        for m in i.members:
+            env = dict(instance_env(cfg, i, m))
+            args = dict(derived_args(cfg, i, m))
+            args.update(i.args)
+            resolved[m.name] = {
+                "role": i.role,
+                "instance": i.name,
+                "rank": m.rank,
+                "node": m.node,
+                "target": cfg.node_of(m).target,
+                "env": env,
+                "args": args,
+            }
+    return resolved
 
 
 def params_json(cfg: Config) -> str:
@@ -2014,12 +2184,15 @@ def params_json(cfg: Config) -> str:
                                "args": dict(derived_args(cfg, i, m))}
     data = {
         "_readme": PARAMS_README,
+        "features": dict(cfg.features),
         "env": {r: dict(cfg.role_env[r]) for r in ROLES},
         "args": {r: dict(cfg.role_args[r]) for r in ROLES},
         "instances": {i.name: {"env": dict(i.inst_env), "args": dict(i.inst_args)} for i in cfg.instances},
         "mooncake": {"segment_size": cfg.segment_size, "extra_args": list(cfg.mc_extra)},
         "router": {"prefill_policy": cfg.prefill_policy, "extra_args": list(cfg.router_extra)},
         "derived": derived,
+        "resolved": resolved_members(cfg),
+        "feature_policy": feature_policy(cfg.features),
     }
     return json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n"
 
@@ -2028,8 +2201,8 @@ def params_md(cfg: Config, bodies: dict) -> str:
     how = (f"`{cfg.params_src}` 后带 `--params` 重新渲染" if cfg.params_src
            else f"`{cfg.src_name}` 后重新渲染")
     L = [f"# 启动参数确认：{cfg.prefix}", "",
-         "> **启动前须用户确认**：下列参数与命令确认无误之前，不得执行任何 `launch_cmd`。"
-         f"需要修改请改 {how}、重新上传，再确认一次。", ""]
+         "> **须在对话中展示最终 JSON 并取得用户确认**：展示下方 JSON 中的功能状态、移除清单、每个 member 的完整 env/args，以及 Mooncake/router 实际命令；内容较长时分段展示，不能仅列文件路径。确认前不得创建/启动部署容器、上传脚本或执行 `launch_cmd`。"
+         f"需要修改请改 {how}、重新渲染并重新展示 JSON；确认后再上传。`resolved` JSON 是每个 member 实际 env/args 的权威快照。", ""]
     if cfg.params_src:
         L += [params_source_line(cfg), ""]
     if cfg.scenario_warning:
@@ -2052,8 +2225,12 @@ def generate(cfg: Config, out: Path, warnings: list) -> Path:
         for m in i.members:
             bodies[m.name] = launcher_body(instance_env(cfg, i, m), SERVER_CMD, instance_args(cfg, i, m))
             scripts[m.name] = launcher_script(cfg, m.name, bodies[m.name])
-    bodies["mooncake_master"] = launcher_body([], "mooncake_master", mooncake_args(cfg))
-    scripts["mooncake_master"] = launcher_script(cfg, "mooncake_master", bodies["mooncake_master"])
+    if cfg.features["hicache"]:
+        bodies["mooncake_master"] = launcher_body([], "mooncake_master", mooncake_args(cfg))
+        scripts["mooncake_master"] = launcher_script(cfg, "mooncake_master", bodies["mooncake_master"])
+    else:
+        # A rerender into an existing output directory must not leave an old launcher.
+        (out / "scripts" / "mooncake_master.sh").unlink(missing_ok=True)
     bodies["router"] = launcher_body([], ROUTER_CMD, router_args(cfg))
     scripts["router"] = launcher_script(cfg, "router", router_gate(cfg) + bodies["router"])
     scripts["stop"] = stop_script(cfg)

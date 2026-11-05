@@ -29,7 +29,7 @@ description: 用 remote-linux MCP 给全新的 GPU/DCU 节点做初始化：勘�
    PAIRS 由 survey 的空白盘和用户的意图决定，没有默认值。脚本拒绝碰有任何签名、分区或挂载的盘，备份 fstab，用 UUID + `nofail`，目录权限 777。
 3. 装 docker：
    `DATA_ROOT=/data0/docker bash install_docker.sh`
-   DATA_ROOT 必须是已挂载数据盘上的路径，先和用户确认。默认写入内网仓库 `42.228.13.241:5000`；如需覆盖，传 `REGISTRY="host:port"`，传 `REGISTRY=""` 时不新增（已有配置仍保留）。daemon.json 是合并写入（保留已有的其他键，改前备份为 `daemon.json.bak.<时间>`），并固定加 `"features": {"containerd-snapshotter": false}`：Docker 29 默认用 containerd 镜像存储，此时 data-root 管不到镜像层，镜像会写进系统盘的 `/var/lib/containerd`，系统盘很快撑满（03/04 实测一个 43GB 镜像占 40G）。已装且版本 ≥24 时只更新 daemon.json 并重启 docker，所以节点上有运行中的容器时要先提醒用户重启 docker 的影响。
+   DATA_ROOT 必须是已挂载数据盘上的路径，先和用户确认。需要配置内网仓库时显式传 `REGISTRY="<仓库主机>:<端口>"`；省略或传 `REGISTRY=""` 时不新增仓库（已有配置仍保留）。daemon.json 是合并写入（保留已有的其他键，改前备份为 `daemon.json.bak.<时间>`），并固定加 `"features": {"containerd-snapshotter": false}`：Docker 29 默认用 containerd 镜像存储，此时 data-root 管不到镜像层，镜像会写进系统盘的 `/var/lib/containerd`，系统盘很快撑满（03/04 实测一个 43GB 镜像占 40G）。已装且版本 ≥24 时只更新 daemon.json 并重启 docker，所以节点上有运行中的容器时要先提醒用户重启 docker 的影响。
    如果 containerd 存储里已有镜像，切换会让它们“看不见”，脚本会 ABORT（退出码 12）并列出镜像。此时和用户确认后：先 `docker rmi` 掉（或 save 备份），再 `FORCE_SWITCH=1` 重跑，最后重新 pull。装完用 `docker info -f '{{.Driver}}'` 确认是 `overlay2`，不是 `overlayfs`。安装有重试，网络差时可能要几分钟，timeout 给足（600s 以上）。
 4. 获取并安装驱动：
    - 先向用户确认 GPU/OS、驱动版本和来源。优先让用户提供下载 URL、内部路径或 `.run` 文件；不能根据历史节点、文件名或本地记录猜版本并直接下载。

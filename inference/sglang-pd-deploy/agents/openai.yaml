@@ -1,0 +1,7 @@
+interface:
+  display_name: "SGLang PD 分离部署"
+  short_description: "通过用户选择的连接方式部署 SGLang PD 分离服务，渲染参数并确认后执行。"
+  default_prompt: "使用 $sglang-pd-deploy 为指定节点生成 SGLang PD 分离部署计划，在对话中以 JSON 展示最终环境变量与启动参数，待我确认后执行。"
+
+policy:
+  allow_implicit_invocation: true

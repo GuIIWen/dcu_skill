@@ -1,6 +1,6 @@
 # aider-benchmark 参数与配置说明
 
-这里的数字、行为都来自 2026-10-22 / 10-23 在 tencent05/06 上的实测或读源码，写明了依据；没验证的单独标出。
+这里的数字、行为都来自 2026-10-22 / 10-23 在 node-A/node-B 上的实测或读源码，写明了依据；没验证的单独标出。
 
 ## 1. benchmark.py 命令行参数（用过的）
 
@@ -100,12 +100,12 @@
 | `--speculative-num-draft-tokens` | 必须等于 gamma + 1（本环境 6）。显式传了不等的值，启动直接报错；不传则自动取 6 |
 | `--speculative-num-steps`、`--speculative-eagle-topk` | DSPARK 下只支持 1，传别的值会被强制改成 1 |
 
-- 关掉投机解码：去掉所有 `--speculative-*` 参数。05 上不带 MTP 的服务日志核对过：`speculative_algorithm=None`，`Decode batch` 行里没有 `accept len`，启动耗时统计里 `draft_*` 全是 0。
+- 关掉投机解码：去掉所有 `--speculative-*` 参数。node-A 上不带 MTP 的服务日志核对过：`speculative_algorithm=None`，`Decode batch` 行里没有 `accept len`，启动耗时统计里 `draft_*` 全是 0。
 - 日志里 `accept len` 上限是 6.00（gamma 5 加 1）。
 
 **其他**
 
-- `--context-length`：模型 `max_position_embeddings` 是 1048576，设 307200 或 262144 都合法；超过模型推导出的上限要设环境变量 `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`。06 的服务在 10-23 当天从 307200 变成过 262144，做对照前先确认。
+- `--context-length`：模型 `max_position_embeddings` 是 1048576，设 307200 或 262144 都合法；超过模型推导出的上限要设环境变量 `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`。node-B 的服务在 10-23 当天从 307200 变成过 262144，做对照前先确认。
 - `--reasoning-parser deepseek-v4`：思考内容走 `reasoning_content`，答案走 `content`。
 
 ## 6. litellm 价格表与 `aider/main.py` 的本地改动
@@ -139,8 +139,8 @@ with open("model_prices.json") as f:
 
 | 运行 | 配置 | 结果 |
 |---|---|---|
-| `think-full` | 225 题、8 线程、`--tries 2`、diff、思考开、请求超时 600 秒、重试 1 次、经 06:30000 router 的 PD 服务（带 MTP）、没传 effort | 约 12.5 小时；pass_rate_1 18.2%（41）、pass_rate_2 36.9%（83）；`litellm.Timeout` 538 次；48 题模型一个 token 都没返回；每题平均约 1543 秒 |
-| `max-effort-16` | 16 题、同上并加 `--reasoning-effort max`、经 06:30000 router 的 PD 服务（带 MTP；与 think-full 当时的服务不是同一次部署） | 约 50 分钟；pass_rate_1 50.0%（8/16）、pass_rate_2 62.5%（10/16）；22 次超时；每题平均约 1088 秒 |
+| `think-full` | 225 题、8 线程、`--tries 2`、diff、思考开、请求超时 600 秒、重试 1 次、经 node-B:30000 router 的 PD 服务（带 MTP）、没传 effort | 约 12.5 小时；pass_rate_1 18.2%（41）、pass_rate_2 36.9%（83）；`litellm.Timeout` 538 次；48 题模型一个 token 都没返回；每题平均约 1543 秒 |
+| `max-effort-16` | 16 题、同上并加 `--reasoning-effort max`、经 node-B:30000 router 的 PD 服务（带 MTP；与 think-full 当时的服务不是同一次部署） | 约 50 分钟；pass_rate_1 50.0%（8/16）、pass_rate_2 62.5%（10/16）；22 次超时；每题平均约 1088 秒 |
 
-- 05 上不带 MTP 的服务，单请求的生成速度约 13.5 token/s，所以 600 秒只够生成约 8000 token；06 带 MTP 的服务单请求速度是它的 2.5 倍以上（粗略对比，并发不同）。
+- node-A 上不带 MTP 的服务，单请求的生成速度约 13.5 token/s，所以 600 秒只够生成约 8000 token；node-B 带 MTP 的服务单请求速度是它的 2.5 倍以上（粗略对比，并发不同）。
 - MTP 的 `accept len`：2026-10-19 到 10-22 中午的普通流量平均 3.73（accept rate 0.55，0.47% 的采样 accept rate ≥ 0.97）；10-22 晚上到 10-23 跑测试期间平均 5.40（0.88，48.7% 的采样 ≥ 0.97），接近 6.00 的满值一般对应重复文本。这是从数字推断的，没有逐个请求核对输出。
