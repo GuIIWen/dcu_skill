@@ -1,0 +1,4 @@
+interface:
+  display_name: "SWE-bench 测试"
+  short_description: "SWE-bench Pro 镜像、网络代理、Agent 与网关组合测试"
+  default_prompt: "使用 $swe-bench-run 准备 SWE-bench 测试，选择可用代理和网关，先运行冒烟测试再按指定题集执行。"

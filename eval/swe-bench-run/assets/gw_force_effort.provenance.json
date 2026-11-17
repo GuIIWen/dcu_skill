@@ -1,0 +1,10 @@
+{
+  "source_timestamp_utc": "2026-11-12T14:11:25.623Z",
+  "source_timestamp_asia_shanghai": "2026-11-12 22:11:25 +08:00",
+  "extraction": "Exact historical stdout extraction; UTF-8, LF; no source edits",
+  "bytes": 1203,
+  "sha256": "15a2fd4430eeb1f7c123aaf81d5a9ba72a8ed44861aa9a390040a4fcb271d414",
+  "scope": "Historical LiteLLM 1.109.0 DSV4 gateway hook; no current integration test performed",
+  "source_kind": "Historical remote stdout; original private session is not distributed or required",
+  "distribution_note": "Personal paths and session identifiers omitted from shared metadata"
+}

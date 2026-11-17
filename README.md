@@ -1,8 +1,8 @@
 # dcu_skill
 
-Hygon DCU 节点的四个 agent skill（Claude Code / Codex 通用）的集合目录；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
+Hygon DCU 节点的五个 agent skill（Claude Code / Codex 通用）的集合目录；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
 
-`sglang-pd-deploy` 以内部 `das/SkillHub` 的 `skills/sglang-pd-deploy/` 为主版本，本目录同步其运行文件。PD 的通用修改先在 SkillHub 维护，再同步到这里；`skill-card.md` 等目录注册元数据由 SkillHub 管理。另两个 skill 继续在本仓库维护。
+`sglang-pd-deploy` 以内部 `das/SkillHub` 的 `skills/sglang-pd-deploy/` 为主版本，本目录同步其运行文件。PD 的通用修改先在 SkillHub 维护，再同步到这里；`skill-card.md` 等目录注册元数据由 SkillHub 管理。其余 skill 在本仓库维护。
 
 | 目录 | skill 名 | 作用 |
 |---|---|---|
@@ -10,12 +10,14 @@ Hygon DCU 节点的四个 agent skill（Claude Code / Codex 通用）的集合�
 | [deploy/claude-mem-observer-ops/](deploy/claude-mem-observer-ops) | claude-mem-observer-ops | 检查 claude-mem observer、延迟批处理和经授权的历史队列恢复 |
 | [`inference/sglang-pd-deploy/`](inference/sglang-pd-deploy) | `sglang-pd-deploy` | 在节点上部署 sglang PD 分离推理服务（xPyD + mooncake + sglang_router） |
 | [`eval/aider-benchmark/`](eval/aider-benchmark) | `aider-benchmark` | 在容器里安装并运行 aider polyglot benchmark，对接 OpenAI 兼容的 sglang 服务；含参数配置、结果汇总、重复循环的单请求复现 |
+| [`eval/swe-bench-run/`](eval/swe-bench-run) | `swe-bench-run` | SWE-bench Pro V2 / Harbor 环境准备、镜像站映射与批量下载、agent/网关组合、测试运行与验收 |
 
 ## 前置依赖
 
 - PD 部署：提供能执行目标命令、上传文件、读取日志和退出码的连接适配器，不要求安装特定 MCP。连接凭据由适配器管理。
 - node-setup / aider-benchmark：本机已部署并启动 remote-linux MCP daemon（`remote-linux-mcp` skill 在 remote-mcp 仓库中），会话里能用 `exec`、`write_file`、`read_file`、`list_hosts`。
-- 目标节点：Ubuntu + 海光 DCU + docker CE。
+- 节点初始化和推理部署：Ubuntu + 海光 DCU + docker CE。
+- SWE-bench：使用现有 SSH/远端连接；执行节点的 Python、Docker/Modal 和 Harbor 要求见 [环境准备](eval/swe-bench-run/references/harbor-setup.md)，评测执行节点不要求有 DCU。
 - `inference/sglang-pd-deploy/scripts/render.py` 需要本机 Python >= 3.11，可使用已有虚拟环境。
 
 ## 安装
@@ -23,7 +25,7 @@ Hygon DCU 节点的四个 agent skill（Claude Code / Codex 通用）的集合�
 在仓库根目录执行以下命令，复制实际 skill 目录的内容；目标目录名要和 `SKILL.md` 中的 `name` 一致。示例同时安装到 CC 的 `~/.claude/skills` 和 Codex 的 `~/.agents/skills`：
 
 ```bash
-for skill_path in deploy/node-setup deploy/claude-mem-observer-ops inference/sglang-pd-deploy eval/aider-benchmark; do
+for skill_path in deploy/node-setup deploy/claude-mem-observer-ops inference/sglang-pd-deploy eval/aider-benchmark eval/swe-bench-run; do
   skill_name="${skill_path##*/}"
   for skill_root in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
     mkdir -p "$skill_root/$skill_name"
@@ -118,3 +120,20 @@ python inference/sglang-pd-deploy/scripts/render.py deploy.toml      # 生成 pl
 - 超时有三层：请求超时（yml `timeout`）、失败后重试几次（`benchmark.py` 的 `LONG_TIMEOUT`）、openai 客户端自带重试（yml `max_retries`），不要混。
 - 统计超时数要数异常名 `litellm.Timeout`，不要数单词 `Timeout`。
 - 局限：只覆盖 aider `5dc9490bb` 的 `benchmark/benchmark.py` 和 polyglot-benchmark；`docker load` 路径、数据集 `gradlew` 的修复命令等没有实测的部分，在 SKILL.md 里逐条标注。
+
+## eval/swe-bench-run（swe-bench-run）：SWE-bench 测试
+
+流程：固定题集与环境 → 生成镜像清单 → 预览/执行下载 → 验证 agent 与模型入口 → 小样本基线 → 指定矩阵 → 评分和 usage 对账。脚本面向 Pro V2 / Harbor；其它数据集版本按对应 harness 调整。
+
+| 文件 | 说明 |
+|---|---|
+| [SKILL.md](eval/swe-bench-run/SKILL.md) | 执行入口、必要输入和常用命令 |
+| [references/harbor-setup.md](eval/swe-bench-run/references/harbor-setup.md) | 独立环境安装、Docker/Modal 选择和 oracle/nop 基线 |
+| [references/images-and-proxy.md](eval/swe-bench-run/references/images-and-proxy.md) | 镜像站映射、网络出口和离线导入 |
+| `scripts/prepare_images.py` | 从 task 配置生成准确镜像清单，可 inspect 本地镜像 |
+| `scripts/pull_images.py` | 默认预览；指定 registry 映射后可批量拉取、恢复官方 tag、有限重试并跳过已有镜像 |
+| `scripts/run_subset.py` | 精确选题的 Harbor 启动器，默认预览，加 `--execute` 执行 |
+| `references/agents-and-gateways.md`、`references/run-and-evidence.md` | Agent/API 适配、运行矩阵、停止和结果验收 |
+| `assets/`、`references/litellm-legacy-hook.md` | 历史 LiteLLM / DSV4 固定 max 钩子及适用边界 |
+
+镜像下载流程有标准库测试，可在 skill 目录运行 `python -B -m unittest discover -s scripts/tests -v`。当前自动验证覆盖模拟 Docker 和真实 CLI 预览，未包含真实镜像站拉取。

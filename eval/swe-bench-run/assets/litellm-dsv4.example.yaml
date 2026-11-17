@@ -1,0 +1,18 @@
+# Historical LiteLLM 1.109.0 / DSV4 fixed-max experiment template.
+# Replace backend.invalid and the backend model with this run's verified values.
+# Keep this gateway isolated; validate the callback schema in the installed version.
+litellm_settings:
+  callbacks: gw_force_effort.proxy_handler_instance
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+model_list:
+  - model_name: deepseek-v4-flash-0731
+    litellm_params:
+      model: hosted_vllm/DeepSeek-V4-Flash-0731-Channel-FP8-w8a8
+      api_base: http://backend.invalid:30000/v1
+      api_key: os.environ/UPSTREAM_API_KEY
+      reasoning_effort: max
+      temperature: 1
+      drop_params: true
+    model_info:
+      reasoning_effort_levels: [low, high, max]
