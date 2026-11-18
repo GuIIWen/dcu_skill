@@ -1,0 +1,4 @@
+interface:
+  display_name: "实验清单与可比性"
+  short_description: "采集运行证据并重建实验条件，识别额外配置差异与不可比因素"
+  default_prompt: "使用 $experiment-manifest 从这份运行记录整理实际配置和证据，标明未知条件。"

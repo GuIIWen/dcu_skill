@@ -1,0 +1,4 @@
+interface:
+  display_name: "回归验收与有效性"
+  short_description: "核对测试是否触发、断言是否有据，区分通过、失败和无法判定"
+  default_prompt: "使用 $regression-evidence 核验这个用例是否实际触发、断言是否有证据。"

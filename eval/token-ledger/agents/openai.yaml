@@ -1,0 +1,4 @@
+interface:
+  display_name: "逐请求 Token 账本"
+  short_description: "统一多种调用日志的 token 口径，保留缓存、重试和缺失信息"
+  default_prompt: "使用 $token-ledger 从这份调用日志生成逐请求账本，标出 usage 覆盖和缓存消耗。"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "精度问题定性与定位"
+  short_description: "先确认计算异常证据，再定位模型与算子问题，按需使用 DCU/HCU 专项检查"
+  default_prompt: "使用 $precision-triage 先判断当前异常是否涉及计算正确性，再按证据和预算选择最小定位实验。"

@@ -1,6 +1,6 @@
 # dcu_skill
 
-Hygon DCU 节点的五个 agent skill（Claude Code / Codex 通用）的集合目录；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
+Hygon DCU 节点部署、推理排障和实验评测的 agent skill 集合（Claude Code / Codex 通用）；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
 
 `sglang-pd-deploy` 以内部 `das/SkillHub` 的 `skills/sglang-pd-deploy/` 为主版本，本目录同步其运行文件。PD 的通用修改先在 SkillHub 维护，再同步到这里；`skill-card.md` 等目录注册元数据由 SkillHub 管理。其余 skill 在本仓库维护。
 
@@ -9,8 +9,14 @@ Hygon DCU 节点的五个 agent skill（Claude Code / Codex 通用）的集合�
 | [`deploy/node-setup/`](deploy/node-setup) | `node-setup` | 全新 GPU/DCU 节点初始化：勘察、挂盘、装 docker、装海光 DCU 驱动 |
 | [deploy/claude-mem-observer-ops/](deploy/claude-mem-observer-ops) | claude-mem-observer-ops | 检查 claude-mem observer、延迟批处理和经授权的历史队列恢复 |
 | [`inference/sglang-pd-deploy/`](inference/sglang-pd-deploy) | `sglang-pd-deploy` | 在节点上部署 sglang PD 分离推理服务（xPyD + mooncake + sglang_router） |
+| [`inference/precision-triage/`](inference/precision-triage) | `precision-triage` | 精度问题定性、固定输入重放与路径核验，含 DCU/NV、版本和参数分支对照 |
 | [`eval/aider-benchmark/`](eval/aider-benchmark) | `aider-benchmark` | 在容器里安装并运行 aider polyglot benchmark，对接 OpenAI 兼容的 sglang 服务；含参数配置、结果汇总、重复循环的单请求复现 |
 | [`eval/swe-bench-run/`](eval/swe-bench-run) | `swe-bench-run` | SWE-bench Pro V2 / Harbor 环境准备、镜像站映射与批量下载、agent/网关组合、测试运行与验收 |
+| [`eval/experiment-manifest/`](eval/experiment-manifest) | `experiment-manifest` | 记录本轮实际运行条件、证据位置和对照限制 |
+| [`eval/regression-evidence/`](eval/regression-evidence) | `regression-evidence` | 核验目标路径触发和断言证据，区分通过、失败与不可判定 |
+| [`eval/token-ledger/`](eval/token-ledger) | `token-ledger` | 从请求记录统计 Token、缓存、重试及覆盖缺口 |
+
+做 DCU 精度对照时，从 [DCU/HCU 专项参考](inference/precision-triage/references/dcu-hcu.md) 选首轮最小对照。只有需要额外整理运行条件、验收证据或用量时，才选用对应的通用 skill。四个包都支持独立安装；可直接填写[定位记录](inference/precision-triage/assets/diagnosis-template.md)、[精度报告](eval/experiment-manifest/assets/accuracy-template.md)或[性能报告](eval/experiment-manifest/assets/performance-template.md)。
 
 ## 前置依赖
 
@@ -22,10 +28,11 @@ Hygon DCU 节点的五个 agent skill（Claude Code / Codex 通用）的集合�
 
 ## 安装
 
-在仓库根目录执行以下命令，复制实际 skill 目录的内容；目标目录名要和 `SKILL.md` 中的 `name` 一致。示例同时安装到 CC 的 `~/.claude/skills` 和 Codex 的 `~/.agents/skills`：
+在仓库根目录执行以下命令，复制实际 skill 目录的内容；目标目录名要和 `SKILL.md` 中的 `name` 一致。示例安装全部技能到 CC 的 `~/.claude/skills` 和 Codex 的 `~/.agents/skills`；只需要某个技能时，把循环的路径替换为表里对应的目录：
 
 ```bash
-for skill_path in deploy/node-setup deploy/claude-mem-observer-ops inference/sglang-pd-deploy eval/aider-benchmark eval/swe-bench-run; do
+for skill_path in deploy/* inference/* eval/*; do
+  [ -f "$skill_path/SKILL.md" ] || continue
   skill_name="${skill_path##*/}"
   for skill_root in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
     mkdir -p "$skill_root/$skill_name"
