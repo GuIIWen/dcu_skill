@@ -2,7 +2,7 @@
 
 Hygon DCU 节点部署、推理排障和实验评测的 agent skill 集合（Claude Code / Codex 通用）；`dcu_skill` 本身不是一个 skill。PD 部署支持用户提供的 SSH、跳板机、Ansible、Kubernetes、remote-linux MCP 等连接方式；节点初始化与 aider benchmark 当前通过 [remote-linux MCP](https://github.com/GuIIWen/remote-mcp) 操作远端 Linux 节点。
 
-`sglang-pd-deploy` 以内部 `das/SkillHub` 的 `skills/sglang-pd-deploy/` 为主版本，本目录同步其运行文件。PD 的通用修改先在 SkillHub 维护，再同步到这里；`skill-card.md` 等目录注册元数据由 SkillHub 管理。其余 skill 在本仓库维护。
+`sglang-pd-deploy` 以内部 `das/SkillHub` 的 `skills/sglang-pd-deploy/` 为主版本，本目录以其运行文件为基础，并同步本地的 Mooncake Store 独立开关。PD 通用版本在 SkillHub 维护，`skill-card.md` 等目录注册元数据由 SkillHub 管理。其余 skill 在本仓库维护。
 
 | 目录 | skill 名 | 作用 |
 |---|---|---|
@@ -84,7 +84,7 @@ done
 | `inference/sglang-pd-deploy/assets/deploy.example.toml` | 脱敏的部署清单模板（默认 1P1D、每实例 8 卡、两台节点） |
 | `inference/sglang-pd-deploy/assets/deepep-config.json` | 默认 deepep 配置 |
 | `inference/sglang-pd-deploy/scripts/render.py` | 展开拓扑，校验，生成脚本、`plan.md`、`params.md`、`params.json`、`plan.json` |
-| `inference/sglang-pd-deploy/references/features.md` | HiCache/MTP 开关、Mooncake Store 与传输引擎、默认模型 profile、日志判断 |
+| `inference/sglang-pd-deploy/references/features.md` | CPU HiCache、Mooncake Store 和 MTP 开关，PD 传输、默认模型 profile 与日志判断 |
 | `inference/sglang-pd-deploy/agents/openai.yaml` | skill 展示信息与调用提示 |
 
 快速使用：
@@ -97,8 +97,8 @@ python inference/sglang-pd-deploy/scripts/render.py deploy.toml      # 生成 pl
 要点：
 
 - 所有启动命令都取自 `plan.json`，不手拼；改参数就改 `deploy.toml` 后重新渲染。
-- `[features]` 默认 `hicache=true`、`mtp=true`；用户要求关闭时写入配置，再重新渲染。必须在对话中以 JSON 展示完整最终 env/args、功能移除清单及 Mooncake/router 状态和命令，再取得确认；文件路径和表格仅作辅助，不能代替 JSON 展示。
-- HiCache 关闭时不启动 Mooncake Store master/metadata，不分配 Store segment；保留 worker 内的 Mooncake Transfer Engine 用于 PD KV 传输。
+- `[features]` 默认启用 `hicache`、`mooncake` 和 `mtp`。修改后重新渲染。必须在对话中以 JSON 展示完整最终 env/args、功能移除清单及 Mooncake/router 状态和命令，再取得确认；文件路径和表格仅作辅助，不能代替 JSON 展示。
+- 要保留 CPU HiCache 并关闭 L3 Store，设置 `hicache=true`、`mooncake=false`。关闭 HiCache 也会关闭 Store。两种情况下均保留 Mooncake Transfer Engine 用于 PD KV 传输。
 - `KV Cache is allocated` 是普通 GPU KV 内存池日志，关闭 HiCache 后仍会出现；核对实际 `enable_hierarchical_cache=False` 和当前镜像的 `hicache_attached=False` 判断开关。
 - Prefill/Decode 默认包含 `--json-model-override-args '{"dsv4_reasoning_effort_profile":"official"}'`，已有配置需显式合并该键。
 - 服务只在容器内运行；未经确认不执行任何写操作，不删容器，不动 docker 配置。

@@ -22,7 +22,7 @@
 #     env : HIP_VISIBLE_DEVICES  NCCL_SOCKET_IFNAME  GLOO_SOCKET_IFNAME  NCCL_IB_HCA
 #           UCX_NET_DEVICES  MC_ALLOWED_IBV_DEVICES  SGLANG_TORCH_PROFILER_DIR
 #           MOONCAKE_LOCAL_HOSTNAME  MOONCAKE_TE_META_DATA_SERVER  MOONCAKE_MASTER
-#           MOONCAKE_GLOBAL_SEGMENT_SIZE   （这四项仅在 HICache 开启时注入 prefill；decode 不设）
+#           MOONCAKE_GLOBAL_SEGMENT_SIZE   （这四项仅在 HICache 和 Mooncake Store 均开启时注入 prefill；decode 不设）
 #     args: --port --host --model-path --speculative-draft-model-path --served-model-name
 #           --dist-init-addr --nnodes --node-rank --deepep-config --disaggregation-mode
 #           --disaggregation-bootstrap-port --disaggregation-ib-device
@@ -36,10 +36,13 @@ prefix = "dsv4flash"   # [必填] 容器/实例名前缀：<prefix>_prefill_<n>�
 #   hicache = false：自动移除 enable-hierarchical-cache、hicache-*、enable-two-batch-overlap；
 #                  关闭 Store master / HTTP metadata，移除对应的四项派生 MOONCAKE_* 环境变量；
 #                  保留 disaggregation-transfer-backend=mooncake（P2PHANDSHAKE，仍负责 PD 传输）。
+#   mooncake = false：仅关闭 L3 Store，移除 hicache-storage-backend / hicache-storage-prefetch-policy
+#                  和四项 Store 环境变量；保留 CPU HiCache 的启用、比例、布局、IO、写策略及 overlap 参数。
 #   mtp     = false：自动移除 speculative-* 参数和 DSPARK/MTP 专用环境变量；
 #                  派生的 speculative-draft-model-path 也会随之消失；DeepEP 通用容量配置保留。
 [features]
 hicache = true
+mooncake = true   # L3 Store；仅 hicache 和 mooncake 同时为 true 时启用；不控制 PD Transfer Engine
 mtp     = true
 
 # ───────────────────────── 节点 ─────────────────────────
@@ -74,7 +77,7 @@ ref = "<镜像仓库>/sglang:<版本标签>"   # [必填] 填写用户提供的�
 pull_policy = "if_not_present"
 
 # ───────────────────────── 容器 ─────────────────────────
-# 每个实例一个容器，容器名 = 实例名。router 和启用 HICache 时的 mooncake master 跑在 prefill_1 的容器里。
+# 每个实例一个容器，容器名 = 实例名。router 和启用 Mooncake Store 时的 mooncake master 跑在 prefill_1 的容器里。
 # 生成的 docker run（基于已验证命令）：
 #   docker run -dit --network=host --name=<实例名> --privileged --device=/dev/kfd --device=/dev/dri
 #     --ipc=host --shm-size=<shm_size> --group-add video --cap-add=SYS_PTRACE
@@ -111,7 +114,7 @@ poll_interval_s   = 30
 card_busy_mem_pct = 5    # 卡检查：显存占用 % 超过此值，或卡上有进程，判 BUSY
 
 # ───────────────────────── mooncake master（跑在 prefill_1 容器） ─────────────────────────
-# 仅 features.hicache=true 时启用；false 时本段配置不生效、不生成 master 脚本。
+# 仅 features.hicache=true 且 features.mooncake=true 时启用；否则不生成 master 脚本。
 # mooncake_master --enable_http_metadata_server=true --http_metadata_server_host=<prefill_1 节点 ip>
 #   --http_metadata_server_port=<metadata_port> --rpc_port=<rpc_port> <extra_args...>
 # 派生给 prefill：MOONCAKE_TE_META_DATA_SERVER=http://<ip>:<metadata_port>/metadata
@@ -133,7 +136,7 @@ prefill_policy = "round_robin"
 extra_args     = []
 
 # ───────────────────────── 拓扑（写法 A：场景简写，默认） ─────────────────────────
-# 实例名 <prefix>_prefill_<n> / <prefix>_decode_<n>，n 按展开顺序从 1 开始；prefill_1 的 rank0 容器跑 router，HICache 开启时也跑 mooncake master。
+# 实例名 <prefix>_prefill_<n> / <prefix>_decode_<n>，n 按展开顺序从 1 开始；prefill_1 的 rank0 容器跑 router，Mooncake Store 开启时也跑 master。
 [topology]
 prefill        = 1          # prefill 实例数
 decode         = 1          # decode 实例数

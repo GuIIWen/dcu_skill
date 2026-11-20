@@ -1,6 +1,19 @@
 # 功能开关与参数归属
 
-默认 `hicache=true`、`mtp=true`。功能关闭时以 `scripts/render.py` 的 feature policy 为准；最终值在 `params.json.resolved` 和 `params.md` 中确认。仅生成脚本的请求不授权启动服务。
+默认 `hicache=true`、`mooncake=true`、`mtp=true`。`features.mooncake` 仅控制模板的 L3 Store，不控制 PD Transfer Engine。Store 实际启用条件为 `hicache && mooncake`，CPU HiCache 不依赖 Store。功能关闭时以 `scripts/render.py` 的 feature policy 为准；最终值在 `params.json.resolved` 和 `params.md` 中确认。仅生成脚本的请求不授权启动服务。
+
+## 仅关闭 Mooncake Store，保留 CPU HiCache
+
+```toml
+[features]
+hicache = true
+mooncake = false
+mtp = true
+```
+
+`--params` JSON 同样接受 `features.mooncake=false`，优先于 TOML。此时保留 `--enable-hierarchical-cache`、`--hicache-ratio`、`--enable-two-batch-overlap`、`--hicache-mem-layout`、`--hicache-io-backend`、`--hicache-write-policy`；只移除 `--hicache-storage-backend`、`--hicache-storage-prefetch-policy` 和下面列出的四项 Store 环境变量。实例覆盖也不能重新引入被关闭的 Store 参数。
+
+旧版没有独立 Store 开关；若旧参数文件通过 `hicache=false` 关闭了 Mooncake，其 `args` 中的 HiCache 参数已经被移除。迁移时设置 `hicache=true, mooncake=false`，并从原配置或模板补回六项 CPU HiCache/overlap 参数后重新渲染；渲染器不会替已有参数文件补齐模板。
 
 ## 关闭 HICache
 
@@ -27,21 +40,23 @@
 
 ## Mooncake：传输引擎与 Store 分开
 
-| 项目 | HICache 开启（模板使用 Mooncake Store） | HICache 关闭 |
-| --- | --- | --- |
-| worker 内的 Mooncake Transfer Engine | 保留，用于 PD KV 传输 | 保留，用于 PD KV 传输 |
-| `--disaggregation-transfer-backend mooncake` | 保留 | 保留 |
-| RDMA 设备、`MC_ALLOWED_IBV_DEVICES`、`MOONCAKE_PROTOCOL=rdma` | 保留 | 保留 |
-| Store master / HTTP metadata | 生成脚本并启动 | 不生成、不上传、不启动 |
-| master 工具、固定端口、Store segment 检查 | 执行 | 跳过 |
-| `MOONCAKE_LOCAL_HOSTNAME` | Prefill 派生 | 不注入 |
-| `MOONCAKE_TE_META_DATA_SERVER` | Prefill 派生 | 不注入 |
-| `MOONCAKE_MASTER` | Prefill 派生 | 不注入 |
-| `MOONCAKE_GLOBAL_SEGMENT_SIZE` | Prefill 派生，模板 25GB/rank | 不注入，不分配 Store segment |
+| 项目 | hicache=true, mooncake=true | hicache=true, mooncake=false | hicache=false |
+| --- | --- | --- | --- |
+| CPU HiCache 参数 | 保留 | 保留 | 移除 |
+| `hicache-storage-backend` / `hicache-storage-prefetch-policy` | 保留 | 移除 | 移除 |
+| worker 内的 Mooncake Transfer Engine | 保留，用于 PD KV 传输 | 保留，用于 PD KV 传输 | 保留，用于 PD KV 传输 |
+| `--disaggregation-transfer-backend mooncake` | 保留 | 保留 | 保留 |
+| RDMA 设备、`MC_ALLOWED_IBV_DEVICES`、`MOONCAKE_PROTOCOL=rdma` | 保留 | 保留 | 保留 |
+| Store master / HTTP metadata | 生成脚本并启动 | 不生成、不上传、不启动 | 不生成、不上传、不启动 |
+| master 工具、固定端口、Store segment 检查 | 执行 | 跳过 | 跳过 |
+| `MOONCAKE_LOCAL_HOSTNAME` | Prefill 派生 | 不注入 | 不注入 |
+| `MOONCAKE_TE_META_DATA_SERVER` | Prefill 派生 | 不注入 | 不注入 |
+| `MOONCAKE_MASTER` | Prefill 派生 | 不注入 | 不注入 |
+| `MOONCAKE_GLOBAL_SEGMENT_SIZE` | Prefill 派生，模板 25GB/rank | 不注入，不分配 Store segment | 不注入，不分配 Store segment |
 
 当前核对的 SGLang 0.5.18 / DTK 26041 镜像，`sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py` 的 `MooncakeTransferEngine.initialize()` 使用 `P2PHANDSHAKE`，不连接外部 Store master/metadata。`MOONCAKE_CHECK_SERVER` 和 `SGLANG_KV_LAYOUT_HCU_FA` 保留模板值，不属于这四项 Store 地址/容量配置。
 
-`plan.json` 保留 `mooncake` 对象以明确状态：`enabled=false`、`hicache_enabled=false`，`launch_cmd`、`stop_cmd`、`listen_check_cmd`、`mem_cmd`、`log`、`expected_total` 为 `null`，`ports=[]`、`ranks=0`；`stop_order` 不包含 `mooncake`。输入 `[mooncake]` 的端口、segment 和 extra_args 可保留，关闭时不用于启动或检查。旧输出目录中的 `scripts/mooncake_master.sh` 在重新渲染时移除，远端已有组件必须另按已确认的旧计划停服，渲染器不操作远端。
+`plan.json` 保留 `mooncake` 对象以明确状态：Store 关闭时 `enabled=false`；`hicache_enabled` 独立反映 CPU HiCache 状态，可以为 `true`。`launch_cmd`、`stop_cmd`、`listen_check_cmd`、`mem_cmd`、`log`、`expected_total` 为 `null`，`ports=[]`、`ranks=0`；`stop_order` 不包含 `mooncake`。输入 `[mooncake]` 的端口、segment 和 extra_args 可保留，关闭时不用于启动或检查。旧输出目录中的 `scripts/mooncake_master.sh` 在重新渲染时移除，远端已有组件必须另按已确认的旧计划停服，渲染器不操作远端。`features` 保存请求值，`feature_policy.mooncake.enabled` 与 `plan.mooncake.enabled` 保存实际状态；即使请求 `mooncake=true`，`hicache=false` 也会关闭 Store。
 
 因此这里“关闭 Mooncake”指关闭 Store 服务；若用户要求连传输引擎也关闭，须另行选择并确认受当前模型/镜像支持的 PD 传输后端，不能只删传输库。
 

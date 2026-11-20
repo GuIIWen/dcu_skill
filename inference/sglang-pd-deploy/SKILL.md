@@ -1,6 +1,6 @@
 ---
 name: sglang-pd-deploy
-description: 按渲染后的部署计划，在用户提供的连接方式上部署、重启、停止并验收 SGLang PD 分离推理服务（xPyD + Mooncake + sglang_router）。连接方式可以是 SSH、跳板机、Ansible、Kubernetes exec/cp、remote-linux MCP、CI runner 或其它能执行目标命令并传输文件的方案；本 skill 不要求或安装特定远端连接工具。仅限 SGLang PD 分离、单机实例；可切换模型和版本。
+description: 按渲染后的部署计划，在用户提供的连接方式上部署、重启、停止并验收 SGLang PD 分离推理服务（xPyD + Mooncake + sglang_router）。连接方式可以是 SSH、跳板机、Ansible、Kubernetes exec/cp、remote-linux MCP、CI runner 或其它能执行目标命令并传输文件的方案；本 skill 不要求或安装特定远端连接工具。仅限 SGLang PD 分离、单机实例；可切换模型和版本，单独配置 CPU HiCache、Mooncake Store 和 MTP。
 ---
 
 # sglang PD 分离部署
@@ -13,8 +13,9 @@ description: 按渲染后的部署计划，在用户提供的连接方式上部�
 - **当前只支持单机实例**：每个 prefill / decode 实例必须在一台节点内（`cards ≤ cards_per_node`，如 8 卡）；一个节点上可以放多个实例（卡不重叠），多节点上可以分别放不同实例。**一个实例跨多台节点（多机 TP / EP）暂不支持**：用户提出这类场景（`prefill_cards`/`decode_cards` 大于 `cards_per_node`，或显式写 `nodes = [...]`）时，告知不支持，不要生成也不要部署。render.py 里的跨节点代码未在真机验证，不得使用。
 - 运行环境：节点是 Hygon DCU（hy-smi / ROCm 系），服务在容器内运行。节点连接由用户选择并负责提供；本 skill 只要求连接适配器能够在指定目标上执行计划命令、读取输出和日志、上传渲染脚本。
 
-默认功能开关是 `features.hicache = true`、`features.mtp = true`。用户说“关闭 HICache”或“关闭 MTP”时，必须写入 `deploy.toml` 的 `[features]`，或写入 `--params` JSON 的 `features` 段后重新渲染，不能只在口头确认里记住：
+默认功能开关是 `features.hicache = true`、`features.mooncake = true`、`features.mtp = true`。用户说“关闭 HICache”“关闭 Mooncake”或“关闭 MTP”时，必须写入 `deploy.toml` 的 `[features]`，或写入 `--params` JSON 的 `features` 段后重新渲染，不能只在口头确认里记住：
 
+- 只关闭 Mooncake Store：设置 `features.mooncake=false`，保留 `features.hicache=true`；只移除 `--hicache-storage-backend`、`--hicache-storage-prefetch-policy` 和四项 Store 环境变量，关闭下述 master/metadata 及 Store 检查。保留 `--enable-hierarchical-cache`、`--hicache-ratio`、`--enable-two-batch-overlap`、`--hicache-mem-layout`、`--hicache-io-backend`、`--hicache-write-policy`，使用 GPU + CPU 两级 HiCache。不得用 `hicache=false` 代替“关闭 Mooncake”。
 - 关闭 HICache：移除 `--enable-hierarchical-cache`、`--hicache-ratio`、`--enable-two-batch-overlap`、`--hicache-mem-layout`、`--hicache-io-backend`、`--hicache-write-policy`、`--hicache-storage-backend`、`--hicache-storage-prefetch-policy`；保留 `--disaggregation-transfer-backend mooncake`，因为它仍负责 PD 的 KV 传输。
 - HICache 关闭时，同时关闭 Mooncake **Store master / HTTP metadata 服务**，移除 `MOONCAKE_LOCAL_HOSTNAME`、`MOONCAKE_TE_META_DATA_SERVER`、`MOONCAKE_MASTER`、`MOONCAKE_GLOBAL_SEGMENT_SIZE`；不生成或上传 `mooncake_master.sh`，不检查 master 工具、端口或 Store segment 分配。`plan.mooncake.enabled=false`，该组件的启动/停止/检查命令为 `null`，`stop_order` 不包含它。保留 worker 内的 **Mooncake Transfer Engine**、RDMA 参数和传输库；当前 SGLang 0.5.18 镜像使用 `P2PHANDSHAKE`，无需外部 master/metadata。这里“关闭 Mooncake”指关闭 Store 服务，不能把 PD 传输库也删掉。详见 [功能开关与参数归属](references/features.md)。
 - 关闭 MTP：移除 `--speculative-algorithm`、`--speculative-num-steps`、`--speculative-eagle-topk`、`--speculative-num-draft-tokens`、`--speculative-moe-a2a-backend`、`--speculative-moe-runner-backend`，以及模板列出的五项 `SGLANG_DSPARK_*` 和 `SGLANG_RAGGED_VERIFY_MODE`；由 `speculative-algorithm` 派生的 `--speculative-draft-model-path` 也必须消失。`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` 是主模型也使用的通用 DeepEP 容量配置，关闭 MTP 时保留；参数归属和当前默认值见上述参考。
@@ -113,7 +114,7 @@ Prefill 与 Decode 模板默认均传入 `--json-model-override-args '{"dsv4_rea
 - 跑 `image.check_cmd`。存在且 `pull_policy != always` → 跳过。
 - 需要拉：跑 `image.pull_cmd`（后台）后**立即进入第 5 步**，不要干等。之后在参数确认的间隙每 30 秒左右 `tail -n 3 <pull_log>` 并跑 `check_cmd`，直到镜像存在。`pull_log` 里出现 `Error`/`denied`/`connection refused`/`no such host`/`http: server gave HTTP response to HTTPS client` 等错误 → 停下报告，不自动反复重试、不改 Docker 配置；用户明确说明已在节点外修好 registry 配置后，可以重新跑一次 `check_cmd` 和 `pull_cmd`，继续原流程。
 - `pull_policy = never` 且不存在 → 预检阶段就已是 FAIL。
-- **镜像工具检查（执行方执行，主流程审核）**：哪个节点的镜像就绪，就在该节点跑 `image.tools_check_cmd`（仅允许计划中的一次性检查容器，不挂设备、不起模型服务），不用等所有节点。缺 `sglang`/`curl`/`sglang_router`，或 HICache 开启时缺 `mooncake_master` → 停下报告，不建部署容器。HICache 开启时没有 `rpc_port_ok` 的处理见第 6 步；关闭时不要求 master 工具。
+- **镜像工具检查（执行方执行，主流程审核）**：哪个节点的镜像就绪，就在该节点跑 `image.tools_check_cmd`（仅允许计划中的一次性检查容器，不挂设备、不起模型服务），不用等所有节点。缺 `sglang`/`curl`/`sglang_router`，或 Mooncake Store 开启时缺 `mooncake_master` → 停下报告，不建部署容器。Mooncake Store 开启时没有 `rpc_port_ok` 的处理见第 6 步；关闭时不要求 master 工具。
 
 ### 5. 参数确认（硬性关口 2，启动前必须通过；在拉镜像期间进行）
 
@@ -141,7 +142,7 @@ Prefill 与 Decode 模板默认均传入 `--json-model-override-args '{"dsv4_rea
 - 存在、已退出、配置一致（`on_conflict = reuse`）：`start_cmd`。
 - 用户确认过 recreate：`rm_cmd` 后 `run_cmd`。
 
-先在每个节点以宿主机用户执行 `nodes[].prepare_dirs_cmd`，创建并检查 `<deploy_dir>/{scripts,logs,run,profile}` 可写；失败就停止，不能让容器里的 root 先创建这些目录。然后按预检结论创建/复用容器，再跑 `tools_check_cmd`、`write_check_cmd`（目标容器）：缺工具、容器内模型 `config.json` 不存在、work_dir 不可写 → 停下报告。主流程审核输出后才进入上传；`nodes[].upload_check_cmd` 要等第 7 步文件上传完再执行。复用的老容器以这一步为准（容器里环境可能和镜像不同）。仅在 HICache 开启时，prefill_1 若没有 `rpc_port_ok`，说明这版 mooncake_master 不支持 `--rpc_port`：告诉用户，并建议把 `mooncake.rpc_port` 改回默认 50051，同时在 `mooncake.extra_args` 里去掉相关参数，然后重新渲染；不要自己改脚本。
+先在每个节点以宿主机用户执行 `nodes[].prepare_dirs_cmd`，创建并检查 `<deploy_dir>/{scripts,logs,run,profile}` 可写；失败就停止，不能让容器里的 root 先创建这些目录。然后按预检结论创建/复用容器，再跑 `tools_check_cmd`、`write_check_cmd`（目标容器）：缺工具、容器内模型 `config.json` 不存在、work_dir 不可写 → 停下报告。主流程审核输出后才进入上传；`nodes[].upload_check_cmd` 要等第 7 步文件上传完再执行。复用的老容器以这一步为准（容器里环境可能和镜像不同）。仅在 Mooncake Store 开启时，prefill_1 若没有 `rpc_port_ok`，说明这版 mooncake_master 不支持 `--rpc_port`：告诉用户，并建议把 `mooncake.rpc_port` 改回默认 50051，同时在 `mooncake.extra_args` 里去掉相关参数，然后重新渲染；不要自己改脚本。
 
 ### 7. 上传文件
 
@@ -149,13 +150,13 @@ Prefill 与 Decode 模板默认均传入 `--json-model-override-args '{"dsv4_rea
 
 ### 8. 启动（严格按顺序，前一步就绪才走下一步）
 
-**连续执行，不中途停下**：参数确认通过后，从计划中第一个启用的组件到 router 再到第 9 步验收一口气做完；HICache 关闭时直接从 Prefill/Decode 开始。日志里没有致命报错就直接推进下一个组件，不要每起一个组件就停下来向用户汇报状态、等用户回复或询问“是否继续”；轮询期间也不要结束当前回合。只有三种情况才停下来找用户：出现致命报错、超过 `startup_timeout_s`、全部验收完成。等待模型加载时可以简短输出进度（例如“prefill_1 加载中，已等 6 分钟，日志无报错”），但不要停。
+**连续执行，不中途停下**：参数确认通过后，从计划中第一个启用的组件到 router 再到第 9 步验收一口气做完；Mooncake Store 关闭时直接从 Prefill/Decode 开始。日志里没有致命报错就直接推进下一个组件，不要每起一个组件就停下来向用户汇报状态、等用户回复或询问“是否继续”；轮询期间也不要结束当前回合。只有三种情况才停下来找用户：出现致命报错、超过 `startup_timeout_s`、全部验收完成。等待模型加载时可以简短输出进度（例如“prefill_1 加载中，已等 6 分钟，日志无报错”），但不要停。
 
 执行方按下述阶段启动、轮询并扫描日志；主流程收到状态输出后复查并决定是否进入下一阶段，不把整套部署一次性交给子 agent 自行跑完。`diag_cmd` 只在启动异常或用户要求时执行；致命报错立即上报，由主流程安排按 `stop_order` 收尾。无需另起一个只读子 agent。
 
 每个实例有 `members[]`（每个节点一项，单节点实例只有 rank 0）。`launch_cmd`/`stop_cmd`/`alive_cmd`/`ready_cmd`/`error_scan_cmd`/`warning_scan_cmd`/`log` 都在 member 上，在 member 自己的 `target` 上执行；`health_cmd`/`listen_check_cmd` 在实例顶层，只查 rank0。
 
-1. **mooncake master（仅 HICache 开启时）**：`plan.mooncake.enabled=true` 时执行 `mooncake.launch_cmd`，轮询 `listen_check_cmd` 直到输出 `listening`（最多约 2 分钟）。`enabled=false` 时跳过 master、metadata、Store 检查，直接启动 workers。
+1. **mooncake master（仅 Mooncake Store 开启时）**：`plan.mooncake.enabled=true` 时执行 `mooncake.launch_cmd`，轮询 `listen_check_cmd` 直到输出 `listening`（最多约 2 分钟）。`enabled=false` 时跳过 master、metadata、Store 检查，直接启动 workers。
 2. **所有 prefill**（可同时起）：对每个实例的**每个 member**跑 `launch_cmd`。跨节点实例的所有 rank 必须同时启动（依次连续发出，不要等 rank0 就绪再起其它 rank）。
 3. **所有 decode**（可同时起）：同上。
 4. 轮询每个实例的每个 member，间隔 `run.poll_interval_s`，总超时 `run.startup_timeout_s`：
@@ -179,8 +180,8 @@ Prefill 与 Decode 模板默认均传入 `--json-model-override-args '{"dsv4_rea
 执行方返回以下命令的原始结果；主流程复查关键状态、审核响应和日志后判定部署是否成功：
 
 1. 每个 prefill/decode 的 `health_cmd` = `200`。
-2. HICache 开启时，每个 prefill 实例的每个 member：`mooncake_ok_cmd` 结果 = 该 member 的 `mooncake_expected`（该节点上的卡数；各 member 之和 = 实例 `ranks`）。少了 → 检查 `--enable-hierarchical-cache`、`hicache-storage-backend` 是否被改掉。HICache 关闭时，`mooncake_ok_cmd`/`mooncake_expected` 为 `null`，不把没有 Mooncake store 分配判为失败。
-3. HICache 开启时，`mooncake.mem_cmd` 显示的总量 = `mooncake.expected_total`（master 日志每 10 秒左右刷新一次，没出现就等一会再查）。HICache 关闭时不要求该 Store 内存分配，但仍要验收 PD transfer 和最终请求。
+2. Mooncake Store 开启时，每个 prefill 实例的每个 member：`mooncake_ok_cmd` 结果 = 该 member 的 `mooncake_expected`（该节点上的卡数；各 member 之和 = 实例 `ranks`）。少了 → 检查 `--enable-hierarchical-cache`、`hicache-storage-backend` 是否被改掉。Mooncake Store 关闭时，`mooncake_ok_cmd`/`mooncake_expected` 为 `null`，不把没有 Mooncake store 分配判为失败。
+3. Mooncake Store 开启时，`mooncake.mem_cmd` 显示的总量 = `mooncake.expected_total`（master 日志每 10 秒左右刷新一次，没出现就等一会再查）。Mooncake Store 关闭时不要求该 Store 内存分配，但仍要验收 PD transfer 和最终请求。
 4. `final_curl_validate_batch_cmd`（在 prefill_1 rank0 容器内执行，通过选定适配器发到该容器所在宿主机，`timeout=660`）按 prefill 实例数发送请求；命令会解析每个 JSON 响应，并强制检查 `choices[0].message` 有非空 `content` 或 `reasoning_content`。同时检查 router 日志，确认请求按 `round_robin` 覆盖每个 prefill；`final_curl_batch_cmd` 仅用于需要保留原始响应的调试。把响应和路由覆盖摘要给用户。
 
 5. `router.flush_cache_check_cmd`（final curl 通过后执行）：调用 router 的 `POST /flush_cache`，先打印响应体，最后一行是 `<状态码> ok` / `<状态码> failed=<...>` / `<状态码> bad`。必须是 `200 ok`（状态码 200，且响应里没有非空的 fail 类字段，如 `failed`）。否则部署不算成功，把最后一行和响应体报给用户：`failed=` 列出刷新失败的 worker 及原因（prefill `HTTP 400` 且日志是 `pending requests` 但队列为 0 的，按排障表重启该实例）；`000` = 连不上 router；`404` = 这版 router 不支持 flush_cache。
@@ -205,7 +206,7 @@ Prefill 与 Decode 模板默认均传入 `--json-model-override-args '{"dsv4_rea
 | 现象 | 处理 |
 |---|---|
 | prefill 日志卡在 bootstrap / decode 一直等 prefill | 核对 router 里每个 prefill 的 bootstrap 端口与实例一致（都来自 plan，应一致）；看 `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` |
-| HICache 开启时 mooncake `Mem Storage` 为 0 / prefill 日志没有 `Mooncake store setup successfully` | 检查是否缺 `--enable-hierarchical-cache`，或 `MOONCAKE_MASTER`/metadata 地址不通（在 prefill 容器里 `docker exec <容器> curl http://<p1 ip>:<metadata_port>/metadata`）。HICache 关闭时这些日志和分配不适用 |
+| Mooncake Store 开启时 mooncake `Mem Storage` 为 0 / prefill 日志没有 `Mooncake store setup successfully` | 检查是否缺 `--enable-hierarchical-cache`，或 `MOONCAKE_MASTER`/metadata 地址不通（在 prefill 容器里 `docker exec <容器> curl http://<p1 ip>:<metadata_port>/metadata`）。Mooncake Store 关闭时这些日志和分配不适用 |
 | 服务起不来，需要看硬件 / 网络 | 对相关节点跑 `nodes[].diag_cmd`（只读）：卡占用、网卡、IB 设备与端口状态、GID、内存。按需执行，不要在部署前例行跑 |
 | RDMA / rocshmem 初始化失败 | 跑 `diag_cmd`，看 GID 信息：`ROCSHMEM_IB_GID_INDEX`（默认 0）应指向 RoCE v2 + IPv4 的 index；核对 `ib_devices` 与实际 IB 设备 |
 | 请求一直不返回 / 卡在 prefill 或 decode 队列 | 多半是 router 在 worker 就绪前就收到了请求。先 `stop_cmd` 停 router，按 `stop_order` 停掉并重启所有 prefill/decode，按第 8 步三项就绪判据等全部实例就绪，再起 router、等 `workers_check_cmd` = `registered` 后再发请求 |
